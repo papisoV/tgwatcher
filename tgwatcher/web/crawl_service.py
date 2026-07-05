@@ -1,34 +1,46 @@
 """Crawl service - runs Telethon crawl in a background thread, controllable via start/stop/status."""
+from __future__ import annotations
+
 import asyncio
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 from tgwatcher.client import TGClient
-from tgwatcher.storage import Storage
 
 logger = logging.getLogger(__name__)
 
 
 class CrawlService:
-    def __init__(self, config: dict, async_loop=None, on_status_change: Callable | None = None):
+    def __init__(self, config: dict, async_loop=None, storage=None, on_status_change: Callable | None = None,
+                 get_tg_client: Callable | None = None, tg_lock: threading.Lock | None = None):
         self.config = config
         self._async_loop = async_loop
+        self._storage = storage
         self._on_status_change = on_status_change
+        self._get_tg_client = get_tg_client
+        self._tg_lock = tg_lock or threading.Lock()
+        self._owns_client = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._status = {
             "running": False,
             "mode": "idle",
             "current_group": None,
+            "current_group_index": 0,
             "total_groups": 0,
             "completed_groups": 0,
-            "fetched": 0,
-            "saved": 0,
+            "current_group_fetched": 0,
+            "current_group_saved": 0,
+            "total_fetched": 0,
+            "total_saved": 0,
             "started_at": None,
             "last_crawl_at": None,
             "error": None,
+            "speed": 0,
+            "elapsed_seconds": 0,
+            "eta_seconds": 0,
         }
 
     @property
@@ -39,28 +51,41 @@ class CrawlService:
     def _update_status(self, **kwargs) -> None:
         with self._lock:
             self._status.update(kwargs)
+            snapshot = dict(self._status)
         if self._on_status_change:
             try:
-                self._on_status_change(self.status)
+                self._on_status_change(snapshot)
             except Exception:
                 pass
 
-    def start(self, mode: str = "incremental") -> bool:
+    def _read_status(self, key):
+        with self._lock:
+            return self._status[key]
+
+    def start(self, mode: str = "incremental", offset_date: str | None = None, until_date: str | None = None) -> bool:
         with self._lock:
             if self._status["running"]:
                 return False
         self._stop_event.clear()
+        self._crawl_offset_date = offset_date
+        self._crawl_until_date = until_date
         self._update_status(
             running=True,
             mode=mode,
             current_group=None,
+            current_group_index=0,
             total_groups=len(self.config.get("groups", [])),
             completed_groups=0,
-            fetched=0,
-            saved=0,
+            current_group_fetched=0,
+            current_group_saved=0,
+            total_fetched=0,
+            total_saved=0,
             started_at=datetime.now().isoformat(),
             last_crawl_at=None,
             error=None,
+            speed=0,
+            elapsed_seconds=0,
+            eta_seconds=0,
         )
         thread = threading.Thread(target=self._run_loop, args=(mode,), daemon=True)
         thread.start()
@@ -72,6 +97,7 @@ class CrawlService:
             if not self._status["running"]:
                 return False
         self._stop_event.set()
+        self._update_status(current_group="正在停止...")
         logger.info("Crawl service stop requested")
         return True
 
@@ -80,17 +106,21 @@ class CrawlService:
             if self._async_loop:
                 loop = self._async_loop.get_loop()
                 future = asyncio.run_coroutine_threadsafe(self._crawl(loop, mode), loop)
-                future.result()
+                future.result(timeout=3600)  # 1h hard timeout
             else:
                 loop = asyncio.new_event_loop()
                 try:
                     loop.run_until_complete(self._crawl(loop, mode))
                 finally:
                     loop.close()
+        except TimeoutError:
+            logger.error("Crawl timed out after 1 hour")
+            self._update_status(error="爬取超时 (1小时)")
         except Exception as e:
             logger.error("Crawl service error: %s", e)
             self._update_status(error=str(e))
         finally:
+            self._stop_event.set()
             self._update_status(running=False, current_group=None)
 
     async def _crawl(self, loop: asyncio.AbstractEventLoop, mode: str) -> None:
@@ -103,26 +133,39 @@ class CrawlService:
         limit = crawl_cfg.get("limit", 100)
         interval = crawl_cfg.get("interval_minutes", 30)
 
+        # Prefer dates passed from API call, fall back to config
         offset_date = None
         until_date = None
-        if crawl_cfg.get("offset_date"):
-            offset_date = datetime.fromisoformat(crawl_cfg["offset_date"])
-        if crawl_cfg.get("until_date"):
-            until_date = datetime.fromisoformat(crawl_cfg["until_date"])
+        if mode == "date_range":
+            raw_offset = getattr(self, "_crawl_offset_date", None) or crawl_cfg.get("offset_date")
+            raw_until = getattr(self, "_crawl_until_date", None) or crawl_cfg.get("until_date")
+            if raw_offset:
+                offset_date = datetime.fromisoformat(raw_offset).replace(tzinfo=timezone.utc)
+            if raw_until:
+                until_date = datetime.fromisoformat(raw_until).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
 
-        db_path = self.config["storage"]["db_path"]
-        storage = Storage(db_path)
-        storage.init_db()
+        storage = self._storage
 
-        tg = TGClient(self.config)
-        await tg.connect()
+        # Use shared TGClient if available, otherwise create our own
+        if self._get_tg_client:
+            with self._tg_lock:
+                tg = self._get_tg_client()
+                if tg.client is None or not tg.client.is_connected():
+                    await tg.connect()
+            self._owns_client = False
+        else:
+            loop = self._async_loop.get_loop() if self._async_loop else None
+            tg = TGClient(self.config, loop=loop)
+            await tg.connect()
+            self._owns_client = True
 
         try:
             iteration = 0
             while not self._stop_event.is_set():
                 iteration += 1
                 completed = 0
-                for group in groups:
+                crawl_start = datetime.now()
+                for group_idx, group in enumerate(groups):
                     if self._stop_event.is_set():
                         break
 
@@ -131,37 +174,68 @@ class CrawlService:
                     if not chat_id:
                         continue
 
-                    self._update_status(current_group=group_name, completed_groups=completed)
+                    self._update_status(
+                        current_group=group_name,
+                        current_group_index=group_idx + 1,
+                        completed_groups=completed,
+                        current_group_fetched=0,
+                        current_group_saved=0,
+                    )
 
                     if mode == "full":
                         min_id = 0
+                        msg_limit = limit
                     elif mode == "date_range":
                         min_id = 0
+                        msg_limit = crawl_cfg.get("date_range_limit", 1000)
                     else:
                         last_id = storage.get_last_message_id(
                             chat_id if isinstance(chat_id, int) else 0
                         )
                         min_id = last_id if last_id else 0
+                        msg_limit = limit
 
                     try:
-                        messages = await tg.fetch_messages(
-                            chat_id=chat_id,
-                            limit=limit,
-                            min_id=min_id,
+                        messages = await self._fetch_with_stop_check(
+                            tg, chat_id=chat_id, limit=msg_limit, min_id=min_id,
                             offset_date=offset_date if mode == "date_range" else None,
                             until_date=until_date if mode == "date_range" else None,
                         )
-                        with self._lock:
-                            self._status["fetched"] += len(messages)
+                        fetched = len(messages)
+                        total_fetched = self._read_status("total_fetched") + fetched
+                        self._update_status(
+                            current_group_fetched=fetched,
+                            total_fetched=total_fetched,
+                        )
                         if messages:
                             saved = storage.save_messages(messages)
-                            with self._lock:
-                                self._status["saved"] += saved
+                            total_saved = self._read_status("total_saved") + saved
+                            self._update_status(
+                                current_group_saved=saved,
+                                total_saved=total_saved,
+                            )
                             logger.info("Saved %d/%d messages from %s", saved, len(messages), group_name)
                         else:
                             logger.info("No new messages from %s", group_name)
                     except Exception as e:
                         logger.error("Error crawling %s: %s", group_name, e)
+                        self._update_status(error=f"{group_name}: {e}")
+
+                    if self._stop_event.is_set():
+                        break
+
+                    # Calculate speed & ETA after each group
+                    elapsed = (datetime.now() - crawl_start).total_seconds()
+                    total_fetched = self._read_status("total_fetched")
+                    speed = round(total_fetched / max(elapsed, 1) * 60, 1) if elapsed > 0 else 0
+                    remaining_groups = len(groups) - completed - 1
+                    avg_per_group = elapsed / max(completed + 1, 1)
+                    eta = round(avg_per_group * remaining_groups)
+                    self._update_status(
+                        speed=speed,
+                        elapsed_seconds=round(elapsed),
+                        eta_seconds=eta,
+                    )
 
                     completed += 1
 
@@ -181,4 +255,56 @@ class CrawlService:
                         break
                     await asyncio.sleep(5)
         finally:
-            await tg.disconnect()
+            if self._owns_client:
+                await tg.disconnect()
+                self._owns_client = False
+
+    async def _fetch_with_stop_check(self, tg, **kwargs) -> list:
+        """Fetch messages but check stop_event between individual message fetches.
+
+        Telethon's iter_messages yields one at a time, so we wrap it to
+        check _stop_event after each message and break early if stopped.
+        """
+        if not tg.client:
+            return []
+
+        chat_id = kwargs["chat_id"]
+        limit = kwargs.get("limit", 100)
+        min_id = kwargs.get("min_id", 0)
+        offset_date = kwargs.get("offset_date")
+        until_date = kwargs.get("until_date")
+
+        entity = await tg.client.get_entity(chat_id)
+
+        from tgwatcher.parsers import parse_telethon_message
+        from tgwatcher.schemas import ParsedMessage
+
+        messages: list[ParsedMessage] = []
+        async for msg in tg.client.iter_messages(
+            entity, limit=limit, min_id=min_id, offset_date=offset_date, reverse=True
+        ):
+            if self._stop_event.is_set():
+                logger.info("Stop requested during fetch, returning %d messages so far", len(messages))
+                break
+
+            if msg.text is None and msg.media is None:
+                continue
+
+            if until_date and msg.date:
+                msg_dt = msg.date.replace(tzinfo=None) if msg.date.tzinfo else msg.date
+                until_dt = until_date.replace(tzinfo=None) if until_date.tzinfo else until_date
+                if msg_dt > until_dt:
+                    continue
+
+            parsed = parse_telethon_message(msg, entity)
+            messages.append(parsed)
+
+            # Per-message progress update
+            self._update_status(current_group_fetched=len(messages))
+
+            import random
+            delay = random.uniform(tg.min_delay, tg.max_delay)
+            await asyncio.sleep(delay)
+
+        logger.info("Fetched %d messages from %s", len(messages), getattr(entity, "title", chat_id))
+        return messages

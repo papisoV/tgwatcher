@@ -3,7 +3,7 @@ import argparse
 import os
 from pathlib import Path
 
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, Response
 
 from tgwatcher.web.api import api, init_services
 from tgwatcher.web.async_loop import AsyncLoopManager
@@ -36,12 +36,23 @@ def create_app(config_path: str | None = None) -> Flask:
     def index():
         return send_from_directory(app.static_folder, "index.html")
 
+    @app.route("/favicon.ico")
+    def favicon():
+        return Response(status=204)
+
+    @app.after_request
+    def _no_cache_static(response):
+        if response.content_type and ("javascript" in response.content_type or "html" in response.content_type):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
     return app
 
 
 def main():
     parser = argparse.ArgumentParser(description="TGWatcher Web GUI")
-    parser.add_argument("--port", type=int, default=5000, help="Port to run on")
+    parser.add_argument("--port", type=int, default=5800, help="Port to run on")
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")

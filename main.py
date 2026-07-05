@@ -20,7 +20,6 @@ import yaml
 from tgwatcher.client import TGClient
 from tgwatcher.storage import Storage
 from tgwatcher.listener import start_listener
-from storage import Storage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +47,9 @@ def load_config(path: str | Path = CONFIG_PATH) -> dict:
 
 async def cmd_login(config: dict) -> None:
     tg = TGClient(config)
-    await tg.login_interactive()
+    await tg.connect()
     logger.info("Session saved. You can now run crawling or listing.")
+    await tg.disconnect()
 
 
 async def cmd_list(config: dict) -> None:

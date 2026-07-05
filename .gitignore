@@ -8,3 +8,29 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+
+# Sensitive config (contains API keys, phone number)
+config.yaml
+
+# Telegram session files
+sessions/
+*.session
+*.session-journal
+
+# Database and data files
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+
+# Screenshots and temp files
+screenshot*.png
+*.png
+!tgwatcher/web/static/**/*.png
+
+# Backups
+config.yaml.bak
+
+# Playwright CLI
+.playwright-cli/

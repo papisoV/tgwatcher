@@ -5,7 +5,7 @@ echo ========================================
 echo   TGWatcher - Telegram Group Crawler
 echo ========================================
 echo.
-echo   http://localhost:5000
+echo   http://localhost:5800
 echo.
-python -m tgwatcher.web.app --port 5000
+python -m tgwatcher.web.app --port 5800
 pause

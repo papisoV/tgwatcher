@@ -1,24 +1,26 @@
-"""Real-time message listener (reserved for future use).
+"""Real-time message listener.
 
 Enable with: python main.py --listen
 """
 import asyncio
 import logging
-from datetime import datetime
 
 from telethon import events
 
+from tgwatcher.parsers import parse_telethon_message
+from tgwatcher.schemas import EditUpdate
 from tgwatcher.storage import Storage
 
 logger = logging.getLogger(__name__)
 
 
-async def start_listener(client: "TGClient", storage: Storage, groups: list[dict], on_new_message=None) -> None:
+async def start_listener(client: "TGClient", storage: Storage, groups: list[dict], on_new_message=None, signal_engine=None) -> None:
     """Listen for new messages in real-time and save to DB.
 
     Args:
         on_new_message: Optional callback invoked with msg dict after saving.
                         Used to push real-time updates via SSE.
+        signal_engine: Optional SignalEngine for real-time factor extraction.
     """
     tg = client.client
     if tg is None:
@@ -36,46 +38,50 @@ async def start_listener(client: "TGClient", storage: Storage, groups: list[dict
         if chat_id not in chat_ids:
             return
 
-        text = event.raw_text
-        if not text:
+        if not event.raw_text and not event.message.media:
             return
 
-        forward_from = None
-        if event.message.forward:
-            if event.message.forward.sender:
-                forward_from = getattr(event.message.forward.sender, "first_name", None)
-            elif event.message.forward.chat:
-                forward_from = getattr(event.message.forward.chat, "title", None)
+        chat = event.chat
+        if chat is None:
+            return
 
-        sender_name = None
-        sender_username = None
-        if event.sender:
-            sender_name = getattr(event.sender, "first_name", None)
-            last = getattr(event.sender, "last_name", None)
-            if last:
-                sender_name = f"{sender_name} {last}"
-            sender_username = getattr(event.sender, "username", None)
-
-        msg = {
-            "message_id": event.message.id,
-            "chat_id": chat_id,
-            "chat_title": getattr(event.chat, "title", None),
-            "sender_id": event.sender_id,
-            "sender_name": sender_name,
-            "sender_username": sender_username,
-            "text": text,
-            "reply_to_msg_id": event.message.reply_to_msg_id if event.message.is_reply else None,
-            "forward_from": forward_from,
-            "date": event.message.date,
-            "has_media": event.message.media is not None,
-        }
-        storage.save_messages([msg])
+        parsed = parse_telethon_message(event.message, chat)
+        storage.save_messages([parsed])
         if on_new_message:
             try:
-                on_new_message(msg)
+                on_new_message(parsed.to_dict())
             except Exception:
                 pass
-        logger.info("[LIVE] %s in %s: %s", sender_name or "Unknown", msg.get("chat_title"), text[:50])
+        # Signal processing (if engine is available)
+        if signal_engine:
+            try:
+                signal_engine.process_new_message(parsed.to_dict())
+            except Exception as e:
+                logger.warning("Signal processing failed for msg %d: %s", parsed.message_id, e)
+        logger.info("[LIVE] %s in %s: %s", parsed.sender_name or "Unknown", parsed.chat_title, (parsed.text or "[media]")[:50])
+
+    @tg.on(events.MessageEdited)
+    async def edit_handler(event):
+        chat_id = event.chat_id
+        if chat_id not in chat_ids:
+            return
+        update = EditUpdate(
+            message_id=event.message.id,
+            chat_id=chat_id,
+            text=event.raw_text,
+            edit_date=event.message.edit_date,
+        )
+        storage.update_edited_message(update)
+        logger.info("[EDIT] msg %d in chat %d", event.message.id, chat_id)
+
+    @tg.on(events.MessageDeleted)
+    async def delete_handler(event):
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None or chat_id not in chat_ids:
+            return
+        for msg_id in event.messages:
+            storage.mark_message_deleted(msg_id, chat_id)
+        logger.info("[DEL] %d messages in chat %d", len(event.messages), chat_id)
 
     logger.info("Real-time listener started for %d chats", len(chat_ids))
     await tg.run_until_disconnected()
