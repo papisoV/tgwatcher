@@ -224,7 +224,7 @@ class CrawlService:
                             group_offset_date = last_date.replace(tzinfo=timezone.utc)
                         else:
                             group_offset_date = datetime.now(timezone.utc) - timedelta(days=7)
-                        group_until_date = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+                        group_until_date = datetime.now(timezone.utc)
 
                     try:
                         messages = await self._fetch_with_stop_check(
