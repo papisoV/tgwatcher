@@ -296,6 +296,15 @@ class Storage:
             )
         return result
 
+    def get_last_message_date(self, chat_id: int) -> datetime | None:
+        with self.get_session() as session:
+            result = (
+                session.query(func.max(Message.date))
+                .filter(Message.chat_id == chat_id, Message.is_deleted == False)
+                .scalar()
+            )
+        return result
+
     def get_stats(self) -> dict:
         with self.get_session() as session:
             total = session.query(func.count(Message.id)).filter(Message.is_deleted == False).scalar()

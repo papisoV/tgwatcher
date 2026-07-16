@@ -115,7 +115,14 @@ async function openGroupModal(){
 function closeGroupModal(){document.getElementById('groupModal').style.display='none'}
 async function saveGroups(){
   const items=document.querySelectorAll('#groupList .modal-item.selected');
-  const groups=Array.from(items).map(el=>({id:parseInt(el.dataset.id),name:el.dataset.title,username:el.dataset.username||undefined})).filter(g=>g.id);
+  // Preserve auto_catchup from existing config
+  const cfg=await api('/api/config');
+  const existingMap={};
+  (cfg?.groups||[]).forEach(g=>{if(g.id)existingMap[g.id]=g.auto_catchup||false});
+  const groups=Array.from(items).map(el=>{
+    const id=parseInt(el.dataset.id);
+    return{id,name:el.dataset.title,username:el.dataset.username||undefined,auto_catchup:existingMap[id]||false};
+  }).filter(g=>g.id);
   if(!groups.length){showToast('请至少选择一个群组','error');return}
   const r=await api('/api/config/groups',{method:'PUT',body:JSON.stringify({groups})});
   if(r&&r.status==='updated'){closeGroupModal();loadChats();loadGroupsView()}else showToast('保存失败','error');
@@ -220,16 +227,104 @@ function filterChat(chatId){
 function searchMessages(){currentPage=1;loadMessages(1)}
 function clearSearch(){document.getElementById('searchKeyword').value='';document.getElementById('senderFilter').value='';document.getElementById('searchDateFrom').value='';document.getElementById('searchDateTo').value='';searchMessages()}
 
-async function exportData(fmt){
+// ===== EXPORT MODAL =====
+let _exportPreviewTimer=null;
+
+async function openExportModal(){
+  const chats=await api('/api/chats');
+  const sel=document.getElementById('exportGroupSelect');
+  sel.innerHTML='<option value="">全部群组</option>';
+  if(chats){
+    chats.forEach(c=>{
+      sel.innerHTML+=`<option value="${c.chat_id}">${esc(c.chat_title||'ID:'+c.chat_id)} (${c.msg_count})</option>`;
+    });
+  }
+  if(currentChat){
+    sel.value=currentChat;
+  }
+  setExportQuickDate('7d');
+  document.getElementById('exportModal').style.display='flex';
+}
+
+function closeExportModal(){
+  document.getElementById('exportModal').style.display='none';
+}
+
+function _localDateStr(d){
+  const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+
+function setExportQuickDate(preset){
+  const now=new Date();
+  const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  let from,to;
+  switch(preset){
+    case 'today': from=today;to=today; break;
+    case 'yesterday': from=new Date(today);from.setDate(from.getDate()-1);to=new Date(today);to.setDate(to.getDate()-1); break;
+    case '7d': from=new Date(today);from.setDate(from.getDate()-6);to=today; break;
+    case '30d': from=new Date(today);from.setDate(from.getDate()-29);to=today; break;
+    case 'this_month': from=new Date(now.getFullYear(),now.getMonth(),1);to=today; break;
+    case 'last_month': from=new Date(now.getFullYear(),now.getMonth()-1,1);to=new Date(now.getFullYear(),now.getMonth(),0); break;
+    default: return;
+  }
+  document.getElementById('exportDateFrom').value=_localDateStr(from);
+  document.getElementById('exportDateTo').value=_localDateStr(to);
+  document.querySelectorAll('.export-quick-btn').forEach(b=>b.classList.toggle('active',b.dataset.preset===preset));
+  updateExportPreview();
+}
+
+function clearExportQuickDate(){
+  document.querySelectorAll('.export-quick-btn').forEach(b=>b.classList.remove('active'));
+}
+
+async function updateExportPreview(){
+  clearTimeout(_exportPreviewTimer);
+  _exportPreviewTimer=setTimeout(async()=>{
+    const params=_buildExportQueryParams(1);
+    const data=await api('/api/messages?'+params);
+    const el=document.getElementById('exportPreview');
+    if(data){
+      const fmt=document.querySelector('input[name="exportFormat"]:checked')?.value||'json';
+      el.textContent=`将导出 ${data.total} 条消息 (${fmt.toUpperCase()})`;
+    }else{
+      el.textContent='查询失败';
+    }
+  },300);
+}
+
+function _buildExportQueryParams(size){
+  const params=new URLSearchParams();
+  const chatId=document.getElementById('exportGroupSelect').value;
+  if(chatId)params.set('chat_id',chatId);
+  const df=document.getElementById('exportDateFrom').value;
+  if(df)params.set('date_from',df);
+  const dt=document.getElementById('exportDateTo').value;
+  if(dt)params.set('date_to',dt);
+  params.set('page','1');
+  params.set('size',String(size||1));
+  return params;
+}
+
+async function doExport(){
+  const fmt=document.querySelector('input[name="exportFormat"]:checked')?.value||'json';
   const params=new URLSearchParams({format:fmt});
-  if(currentChat)params.set('chat_id',currentChat);
-  const kw=document.getElementById('searchKeyword').value.trim();if(kw)params.set('keyword',kw);
-  const sid=document.getElementById('senderFilter').value;if(sid)params.set('sender_id',sid);
-  const df=document.getElementById('searchDateFrom').value;if(df)params.set('date_from',df);
-  const dt=document.getElementById('searchDateTo').value;if(dt)params.set('date_to',dt);
+  const chatId=document.getElementById('exportGroupSelect').value;
+  if(chatId)params.set('chat_id',chatId);
+  const df=document.getElementById('exportDateFrom').value;
+  if(df)params.set('date_from',df);
+  const dt=document.getElementById('exportDateTo').value;
+  if(dt)params.set('date_to',dt);
+  if(!df&&!dt){
+    showToast('请选择日期范围','error');return;
+  }
   const r=await fetch(API+'/api/messages/export?'+params,{headers:{'Authorization':'Bearer '+authToken}});
   if(!r.ok){showToast('导出失败','error');return}
-  const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='tgwatcher_export.'+fmt;a.click();
+  const blob=await r.blob();
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  const ext=fmt==='markdown'?'md':fmt;
+  a.download='tgwatcher_export.'+ext;a.click();
+  closeExportModal();
   showToast('已导出 '+fmt.toUpperCase(),'success');
 }
 
@@ -306,14 +401,23 @@ async function loadComparisonChart(){
 // ===== GROUPS VIEW =====
 async function loadGroupsView(){
   const chats=await api('/api/chats');if(!chats)return;
-  document.getElementById('groupsBody').innerHTML=chats.map(c=>`<tr>
+  document.getElementById('groupsBody').innerHTML=chats.map(c=>{
+    const checked=c.auto_catchup?'checked':'';
+    return `<tr>
     <td style="font-weight:500">${esc(c.chat_title||'ID:'+c.chat_id)}</td>
     <td style="font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-2)">${c.chat_type==='channel'?'频道':c.chat_type||'-'}</td>
     <td class="col-num">${c.members||'-'}</td>
     <td class="col-num">${c.msg_count}</td>
     <td class="col-time">${c.last_msg_date?c.last_msg_date.replace('T',' ').slice(0,16):'-'}</td>
+    <td><label class="toggle-switch"><input type="checkbox" ${checked} onchange="toggleAutoCatchup(${c.chat_id},this.checked)"><span class="toggle-slider"></span></label></td>
     <td><button class="btn btn-danger" style="font-size:var(--fs-xs);padding:1px 6px" onclick="removeGroup(${c.chat_id})">✕</button></td>
-  </tr>`).join('');
+  </tr>`}).join('');
+}
+
+async function toggleAutoCatchup(chatId,enabled){
+  const r=await api('/api/config/groups/'+chatId+'/auto_catchup',{method:'PATCH',body:JSON.stringify({auto_catchup:enabled})});
+  if(!r||r.error){showToast(r?.error||'更新失败','error');loadGroupsView()}
+  else showToast(enabled?'已启用自动补爬':'已关闭自动补爬','success');
 }
 
 // ===== PURGE =====
@@ -383,7 +487,7 @@ function updateCrawlUI(s){
   const btnStart=document.getElementById('btnStart');
   const btnStop=document.getElementById('btnStop');
 
-  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围'};
+  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围','catchup':'补爬'};
   dot.className='crawl-bar__dot'+(s.running?' running':'')+(s.error?' error':'');
   if(s.running){
     status.textContent='爬取中';
@@ -448,7 +552,7 @@ function updateCrawlUI(s){
 }
 
 function updateCrawlDetail(s){
-  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围','idle':'—'};
+  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围','catchup':'补爬','idle':'—'};
   document.getElementById('cdKpiMode').textContent=modeLabels[s.mode]||s.mode||'—';
   const gi=s.current_group_index||0,tg=s.total_groups||0;
   document.getElementById('cdKpiGroup').textContent=gi>0?`${gi}/${tg}`:'—';

@@ -139,6 +139,18 @@ def init_services(config, async_loop=None) -> None:
         _signal_service = None
         _signal_engine = None
 
+    # Auto-catchup on startup
+    catchup_cfg = config.get("catchup", {})
+    if catchup_cfg.get("enabled", True):
+        catchup_groups = [g for g in config.get("groups", []) if g.get("auto_catchup", False)]
+        if catchup_groups:
+            def _delayed_catchup():
+                import time
+                time.sleep(5)
+                logger.info("Auto-catchup: starting for %d groups", len(catchup_groups))
+                _crawl_service.start(mode="catchup")
+            threading.Thread(target=_delayed_catchup, daemon=True).start()
+
 
 def _init_signal_engine(config: dict) -> None:
     """Initialize signal engine, LLM client, and service. Called from init_services."""
@@ -297,6 +309,8 @@ def get_messages():
 
     df = datetime.fromisoformat(date_from) if date_from else None
     dt = datetime.fromisoformat(date_to) if date_to else None
+    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        dt = dt.replace(hour=23, minute=59, second=59)
 
     result = _storage.query_messages(
         chat_id=chat_id, keyword=keyword, sender_id=sender_id,
@@ -311,6 +325,10 @@ def get_messages():
 @require_auth
 def get_chats():
     chats = _storage.get_chats()
+    # Merge auto_catchup flag from config
+    group_map = {g.get("id"): g.get("auto_catchup", False) for g in _config.get("groups", [])}
+    for c in chats:
+        c["auto_catchup"] = group_map.get(c["chat_id"], False)
     return jsonify(chats)
 
 
@@ -346,6 +364,9 @@ def export_messages():
 
     df = datetime.fromisoformat(date_from) if date_from else None
     dt = datetime.fromisoformat(date_to) if date_to else None
+    # Include the full end day: "2026-07-15" -> "2026-07-15 23:59:59"
+    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        dt = dt.replace(hour=23, minute=59, second=59)
 
     result = _storage.query_messages(
         chat_id=chat_id, keyword=keyword, sender_id=sender_id,
@@ -369,6 +390,41 @@ def export_messages():
                              m.get("is_edited"), m.get("edited_at"), m.get("media_type")])
         return Response(output.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": "attachment; filename=tgwatcher_export.csv"})
+
+    if fmt == "markdown":
+        lines = ["# 聊天记录导出\n"]
+        meta_parts = []
+        if chat_id:
+            chat_title = messages[0].get("chat_title", "") if messages else ""
+            meta_parts.append(f"群组: {chat_title}" if chat_title else f"群组ID: {chat_id}")
+        else:
+            meta_parts.append("群组: 全部")
+        if date_from:
+            meta_parts.append(f"起始: {date_from}")
+        if date_to:
+            meta_parts.append(f"结束: {date_to}")
+        meta_parts.append(f"共 {len(messages)} 条消息")
+        lines.append(" | ".join(meta_parts))
+        lines.append("")
+        for m in messages:
+            date_str = (m.get("date") or "-").replace("T", " ")[:16]
+            sender = m.get("sender_name") or m.get("sender_username") or "未知"
+            chat_tag = f" [{m.get('chat_title', '')}]" if not chat_id and m.get("chat_title") else ""
+            lines.append(f"### [{date_str}] {sender}{chat_tag}")
+            text = m.get("text") or ""
+            if text:
+                lines.append(text)
+            fwd = m.get("forward_from")
+            if fwd:
+                lines.append(f"*转发自: {fwd}*")
+            reply = m.get("reply_to_msg_id")
+            if reply:
+                lines.append(f"*回复消息ID: {reply}*")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        return Response("\n".join(lines), mimetype="text/markdown",
+                        headers={"Content-Disposition": "attachment; filename=tgwatcher_export.md"})
 
     return jsonify(messages)
 
@@ -405,8 +461,8 @@ def purge_all_data():
 def start_crawl():
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "incremental")
-    if mode not in ("incremental", "full", "date_range"):
-        return jsonify({"error": "Invalid mode. Use: incremental, full, date_range"}), 400
+    if mode not in ("incremental", "full", "date_range", "catchup"):
+        return jsonify({"error": "Invalid mode. Use: incremental, full, date_range, catchup"}), 400
     extra: dict = {}
     if mode == "date_range":
         offset_date = data.get("offset_date")
@@ -417,6 +473,8 @@ def start_crawl():
         extra["until_date"] = until_date
     ok = _crawl_service.start(mode=mode, **extra)
     if not ok:
+        if mode == "catchup" and not [g for g in _config.get("groups", []) if g.get("auto_catchup", False)]:
+            return jsonify({"error": "没有启用自动补爬的群组，请先在群组页面开启"}), 400
         return jsonify({"error": "Crawl already running"}), 409
     return jsonify({"status": "started", "mode": mode})
 
@@ -451,6 +509,7 @@ def get_config():
         "session_dir": _config["telegram"].get("session_dir", "./sessions"),
     }
     safe_config["web"] = _config.get("web", {})
+    safe_config["catchup"] = _config.get("catchup", {"enabled": True, "limit": 1000})
     return jsonify(safe_config)
 
 
@@ -463,10 +522,37 @@ def update_groups():
     for g in data["groups"]:
         if not g.get("id") and not g.get("username"):
             return jsonify({"error": "Each group must have 'id' or 'username'"}), 400
+    # Preserve auto_catchup flags from existing config for groups that still exist
+    existing_map = {g.get("id"): g.get("auto_catchup", False) for g in _config.get("groups", [])}
+    for g in data["groups"]:
+        gid = g.get("id")
+        if gid in existing_map:
+            g.setdefault("auto_catchup", existing_map[gid])
     _config["groups"] = data["groups"]
     config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
     _atomic_write_config(_config, config_path)
     return jsonify({"status": "updated", "groups": _config["groups"]})
+
+
+@api.route("/config/groups/<int:chat_id>/auto_catchup", methods=["PATCH"])
+@require_auth
+def toggle_group_auto_catchup(chat_id):
+    data = request.get_json(silent=True) or {}
+    auto_catchup = data.get("auto_catchup")
+    if auto_catchup is None:
+        return jsonify({"error": "Missing 'auto_catchup' in body"}), 400
+    groups = _config.get("groups", [])
+    found = False
+    for g in groups:
+        if g.get("id") == chat_id:
+            g["auto_catchup"] = bool(auto_catchup)
+            found = True
+            break
+    if not found:
+        return jsonify({"error": "Group not found in config"}), 404
+    config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
+    _atomic_write_config(_config, config_path)
+    return jsonify({"status": "updated", "chat_id": chat_id, "auto_catchup": bool(auto_catchup)})
 
 
 # --- Telegram Dialog API ---

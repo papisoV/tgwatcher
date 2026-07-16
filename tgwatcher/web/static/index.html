@@ -229,11 +229,37 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
 .modal-item-sub{font-size:var(--fs-xs);color:var(--text-2)}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end}
 
+/* ===== EXPORT MODAL ===== */
+.export-section{margin-bottom:14px}
+.export-section__label{font-size:var(--fs-xs);color:var(--text-2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.export-group-select{width:100%;background:var(--bg-4);border:1px solid var(--border);color:var(--text-0);font-size:var(--fs-sm);padding:6px 8px;outline:none;font-family:var(--font-ui)}
+.export-group-select:focus{border-color:var(--cyan)}
+.export-quick-dates{display:flex;flex-wrap:wrap;gap:4px}
+.export-quick-btn{background:var(--bg-4);border:1px solid var(--border);color:var(--text-1);padding:3px 10px;font-size:var(--fs-xs);cursor:pointer;font-family:var(--font-ui);transition:all .15s}
+.export-quick-btn:hover{background:var(--bg-3);color:var(--text-0)}
+.export-quick-btn.active{background:var(--cyan-bg);color:var(--cyan);border-color:var(--cyan-border)}
+.export-date-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+.export-date-input{background:var(--bg-4);border:1px solid var(--border);color:var(--text-0);font-size:var(--fs-sm);padding:4px 6px;width:130px;font-family:var(--font-mono);outline:none}
+.export-date-input:focus{border-color:var(--cyan)}
+.export-date-sep{color:var(--text-3);font-size:var(--fs-xs)}
+.export-format-row{display:flex;gap:12px}
+.export-format-label{display:flex;align-items:center;gap:4px;font-size:var(--fs-sm);color:var(--text-1);cursor:pointer}
+.export-format-label input{accent-color:var(--cyan)}
+.export-preview{font-size:var(--fs-xs);color:var(--text-2);font-family:var(--font-mono);padding:6px 0;border-top:1px solid var(--border);margin-top:4px}
+
 /* ===== TOAST ===== */
 .toast{position:fixed;bottom:16px;right:16px;padding:10px 18px;font-size:var(--fs-sm);z-index:200;max-width:400px;word-break:break-word;border:1px solid var(--border)}
 .toast-error{background:#1a0a0a;color:#fca5a5;border-color:rgba(255,61,113,.3)}
 .toast-success{background:#0a1a0a;color:#86efac;border-color:rgba(0,255,136,.3)}
 .toast-info{background:#0a0f1a;color:#93c5fd;border-color:rgba(0,229,255,.3)}
+
+/* ===== TOGGLE SWITCH ===== */
+.toggle-switch{position:relative;display:inline-block;width:32px;height:18px;vertical-align:middle}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;inset:0;background:var(--bg-4);border:1px solid var(--border);border-radius:9px;transition:.2s}
+.toggle-slider:before{content:"";position:absolute;height:12px;width:12px;left:2px;bottom:2px;background:var(--text-3);border-radius:50%;transition:.2s}
+.toggle-switch input:checked+.toggle-slider{background:var(--cyan-bg);border-color:var(--cyan-border)}
+.toggle-switch input:checked+.toggle-slider:before{transform:translateX(14px);background:var(--cyan)}
 
 /* ===== RESPONSIVE ===== */
 @media(max-width:900px){.left-panel{width:0}.tab-btn{padding:4px 8px;font-size:var(--fs-xs)}}
@@ -291,6 +317,48 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
   </div>
 </div>
 
+<!-- EXPORT MODAL -->
+<div class="modal-overlay" id="exportModal" style="display:none">
+  <div class="modal-panel" style="width:440px">
+    <h2>导出聊天记录</h2>
+    <div class="export-section">
+      <div class="export-section__label">群组</div>
+      <select class="export-group-select" id="exportGroupSelect" onchange="updateExportPreview()">
+        <option value="">全部群组</option>
+      </select>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">快捷日期</div>
+      <div class="export-quick-dates">
+        <button class="export-quick-btn" data-preset="today" onclick="setExportQuickDate('today')">今天</button>
+        <button class="export-quick-btn" data-preset="yesterday" onclick="setExportQuickDate('yesterday')">昨天</button>
+        <button class="export-quick-btn" data-preset="7d" onclick="setExportQuickDate('7d')">近7天</button>
+        <button class="export-quick-btn" data-preset="30d" onclick="setExportQuickDate('30d')">近30天</button>
+        <button class="export-quick-btn" data-preset="this_month" onclick="setExportQuickDate('this_month')">本月</button>
+        <button class="export-quick-btn" data-preset="last_month" onclick="setExportQuickDate('last_month')">上月</button>
+      </div>
+      <div class="export-date-row">
+        <input type="date" id="exportDateFrom" class="export-date-input" onchange="clearExportQuickDate();updateExportPreview()">
+        <span class="export-date-sep">至</span>
+        <input type="date" id="exportDateTo" class="export-date-input" onchange="clearExportQuickDate();updateExportPreview()">
+      </div>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">格式</div>
+      <div class="export-format-row">
+        <label class="export-format-label"><input type="radio" name="exportFormat" value="json" checked onchange="updateExportPreview()"> JSON</label>
+        <label class="export-format-label"><input type="radio" name="exportFormat" value="csv" onchange="updateExportPreview()"> CSV</label>
+        <label class="export-format-label"><input type="radio" name="exportFormat" value="markdown" onchange="updateExportPreview()"> Markdown</label>
+      </div>
+    </div>
+    <div class="export-preview" id="exportPreview">选择日期范围后显示消息数量</div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeExportModal()">取消</button>
+      <button class="btn btn-cyan" onclick="doExport()">导出</button>
+    </div>
+  </div>
+</div>
+
 <!-- MAIN APP -->
 <div id="app" style="display:none;flex-direction:column;height:100vh">
 
@@ -313,6 +381,8 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
           <div class="crawl-dd-menu" id="crawlMenu">
             <div class="crawl-dd-item" onclick="startCrawl('incremental')">增量爬取</div>
             <div class="crawl-dd-item" onclick="startCrawl('full')">全量爬取</div>
+            <div class="crawl-dd-sep"></div>
+            <div class="crawl-dd-item" onclick="startCrawl('catchup')">补爬 (自动补爬群组)</div>
             <div class="crawl-dd-sep"></div>
             <div class="crawl-dd-item" onclick="showDateRangePanel()">按日期范围</div>
           </div>
@@ -393,8 +463,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
           <input class="filter-input filter-date" id="searchDateTo" type="date" title="结束日期">
           <button class="btn btn-cyan" onclick="searchMessages()">搜索</button>
           <button class="btn" onclick="clearSearch()">清空</button>
-          <button class="btn" onclick="exportData('csv')">CSV</button>
-          <button class="btn" onclick="exportData('json')">JSON</button>
+          <button class="btn btn-cyan" onclick="openExportModal()">导出</button>
         </div>
         <div class="table-wrap">
           <table class="data-table">
@@ -486,7 +555,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
           <table class="data-table">
             <thead><tr>
               <th>名称</th><th style="width:80px">类型</th><th style="width:70px">成员</th>
-              <th style="width:80px">消息数</th><th style="width:140px">最后活跃</th><th style="width:70px">操作</th>
+              <th style="width:80px">消息数</th><th style="width:140px">最后活跃</th><th style="width:80px">自动补爬</th><th style="width:70px">操作</th>
             </tr></thead>
             <tbody id="groupsBody"></tbody>
           </table>

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from tgwatcher.client import TGClient
@@ -69,12 +69,24 @@ class CrawlService:
         self._stop_event.clear()
         self._crawl_offset_date = offset_date
         self._crawl_until_date = until_date
+
+        # For catchup mode, pre-filter groups with auto_catchup enabled
+        if mode == "catchup":
+            catchup_groups = [g for g in self.config.get("groups", []) if g.get("auto_catchup", False)]
+            if not catchup_groups:
+                return False
+            self._catchup_groups = catchup_groups
+            total = len(catchup_groups)
+        else:
+            self._catchup_groups = None
+            total = len(self.config.get("groups", []))
+
         self._update_status(
             running=True,
             mode=mode,
             current_group=None,
             current_group_index=0,
-            total_groups=len(self.config.get("groups", [])),
+            total_groups=total,
             completed_groups=0,
             current_group_fetched=0,
             current_group_saved=0,
@@ -124,7 +136,11 @@ class CrawlService:
             self._update_status(running=False, current_group=None)
 
     async def _crawl(self, loop: asyncio.AbstractEventLoop, mode: str) -> None:
-        groups = self.config.get("groups", [])
+        # For catchup mode, use pre-filtered groups; otherwise use all configured groups
+        if mode == "catchup" and getattr(self, "_catchup_groups", None):
+            groups = self._catchup_groups
+        else:
+            groups = self.config.get("groups", [])
         if not groups:
             self._update_status(error="No groups configured")
             return
@@ -188,6 +204,9 @@ class CrawlService:
                     elif mode == "date_range":
                         min_id = 0
                         msg_limit = crawl_cfg.get("date_range_limit", 1000)
+                    elif mode == "catchup":
+                        min_id = 0
+                        msg_limit = self.config.get("catchup", {}).get("limit", 1000)
                     else:
                         last_id = storage.get_last_message_id(
                             chat_id if isinstance(chat_id, int) else 0
@@ -195,11 +214,23 @@ class CrawlService:
                         min_id = last_id if last_id else 0
                         msg_limit = limit
 
+                    # For catchup mode, compute per-group offset_date from last message date
+                    group_offset_date = None
+                    group_until_date = None
+                    if mode == "catchup":
+                        chat_id_int = chat_id if isinstance(chat_id, int) else 0
+                        last_date = storage.get_last_message_date(chat_id_int)
+                        if last_date:
+                            group_offset_date = last_date.replace(tzinfo=timezone.utc)
+                        else:
+                            group_offset_date = datetime.now(timezone.utc) - timedelta(days=7)
+                        group_until_date = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+
                     try:
                         messages = await self._fetch_with_stop_check(
                             tg, chat_id=chat_id, limit=msg_limit, min_id=min_id,
-                            offset_date=offset_date if mode == "date_range" else None,
-                            until_date=until_date if mode == "date_range" else None,
+                            offset_date=group_offset_date if mode == "catchup" else (offset_date if mode == "date_range" else None),
+                            until_date=group_until_date if mode == "catchup" else (until_date if mode == "date_range" else None),
                         )
                         fetched = len(messages)
                         total_fetched = self._read_status("total_fetched") + fetched
