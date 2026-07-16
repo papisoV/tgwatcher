@@ -429,6 +429,293 @@ def export_messages():
     return jsonify(messages)
 
 
+@api.route("/signals/export", methods=["GET"])
+@require_auth
+def export_signals():
+    """Export signal analysis results with message context."""
+    from sqlalchemy import text as sql_text
+
+    fmt = request.args.get("format", "json")
+    chat_id = request.args.get("chat_id", type=int)
+    date_from = request.args.get("date_from", type=str)
+    date_to = request.args.get("date_to", type=str)
+    source = request.args.get("source", "claude")  # deepseek | claude | both
+    signal_only = request.args.get("signal_only", "true").lower() == "true"
+    count_only = request.args.get("count_only", "").lower() == "true"
+
+    df = datetime.fromisoformat(date_from) if date_from else None
+    dt = datetime.fromisoformat(date_to) if date_to else None
+    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        dt = dt.replace(hour=23, minute=59, second=59)
+
+    rows = []
+    with _storage.engine.connect() as conn:
+        # Check if claude_factors table exists
+        has_claude = conn.execute(sql_text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='claude_factors'"
+        )).fetchone() is not None
+
+        if source in ("claude", "both") and not has_claude:
+            return jsonify({"error": "Claude分析数据不存在，请先使用 /tg-analyze 进行分析"}), 404
+
+        # Build query based on source
+        if source == "both":
+            # Join both factor tables with messages
+            where_clauses = ["m.is_deleted = 0", "m.text IS NOT NULL"]
+            params: dict = {}
+            if chat_id:
+                where_clauses.append("m.chat_id = :chat_id")
+                params["chat_id"] = chat_id
+            if df:
+                where_clauses.append("m.date >= :df")
+                params["df"] = df
+            if dt:
+                where_clauses.append("m.date <= :dt")
+                params["dt"] = dt
+            if signal_only:
+                where_clauses.append("cf.is_signal = 1")
+
+            where = " AND ".join(where_clauses)
+
+            if count_only:
+                count = conn.execute(sql_text(f"""
+                    SELECT COUNT(*) FROM messages m
+                    INNER JOIN claude_factors cf ON m.message_id = cf.message_id AND m.chat_id = cf.chat_id
+                    WHERE {where}
+                """), params).scalar()
+                return jsonify({"count": count})
+
+            query = f"""
+                SELECT m.message_id, m.chat_id, m.chat_title, m.sender_name,
+                       m.text, m.date,
+                       cf.sentiment as claude_sentiment, cf.sentiment_label as claude_sentiment_label,
+                       cf.event_type as claude_event_type, cf.scope as claude_scope,
+                       cf.intensity as claude_intensity, cf.urgency as claude_urgency,
+                       cf.affected_tokens as claude_affected_tokens,
+                       cf.action_hint as claude_action_hint,
+                       cf.reasoning as claude_reasoning, cf.is_signal as claude_is_signal,
+                       sf.sentiment as ds_sentiment, sf.sentiment_label as ds_sentiment_label,
+                       sf.event_type as ds_event_type, sf.scope as ds_scope,
+                       sf.intensity as ds_intensity, sf.urgency as ds_urgency,
+                       sf.reasoning as ds_reasoning
+                FROM messages m
+                INNER JOIN claude_factors cf ON m.message_id = cf.message_id AND m.chat_id = cf.chat_id
+                LEFT JOIN signal_factors sf ON m.message_id = sf.message_id AND m.chat_id = sf.chat_id
+                WHERE {where}
+                ORDER BY m.date DESC
+            """
+            for row in conn.execute(sql_text(query), params):
+                rows.append({
+                    "message_id": row.message_id,
+                    "chat_id": row.chat_id,
+                    "chat_title": row.chat_title,
+                    "sender_name": row.sender_name,
+                    "text": row.text,
+                    "date": row.date.isoformat() if row.date else None,
+                    "claude": {
+                        "sentiment": row.claude_sentiment,
+                        "sentiment_label": row.claude_sentiment_label,
+                        "event_type": row.claude_event_type,
+                        "scope": row.claude_scope,
+                        "intensity": row.claude_intensity,
+                        "urgency": row.claude_urgency,
+                        "affected_tokens": json.loads(row.claude_affected_tokens) if row.claude_affected_tokens else [],
+                        "action_hint": row.claude_action_hint,
+                        "reasoning": row.claude_reasoning,
+                        "is_signal": bool(row.claude_is_signal) if row.claude_is_signal is not None else None,
+                    },
+                    "deepseek": {
+                        "sentiment": row.ds_sentiment,
+                        "sentiment_label": row.ds_sentiment_label,
+                        "event_type": row.ds_event_type,
+                        "scope": row.ds_scope,
+                        "intensity": row.ds_intensity,
+                        "urgency": row.ds_urgency,
+                        "reasoning": row.ds_reasoning,
+                    } if row.ds_sentiment is not None else None,
+                })
+        else:
+            # Single source
+            table = "claude_factors" if source == "claude" else "signal_factors"
+            where_clauses = ["m.is_deleted = 0", "m.text IS NOT NULL"]
+            params = {}
+            if chat_id:
+                where_clauses.append("m.chat_id = :chat_id")
+                params["chat_id"] = chat_id
+            if df:
+                where_clauses.append("m.date >= :df")
+                params["df"] = df
+            if dt:
+                where_clauses.append("m.date <= :dt")
+                params["dt"] = dt
+            where_clauses.append(f"f.llm_status = 'completed'")
+            if signal_only and source == "claude":
+                where_clauses.append("f.is_signal = 1")
+
+            where = " AND ".join(where_clauses)
+
+            if count_only:
+                count = conn.execute(sql_text(f"""
+                    SELECT COUNT(*) FROM messages m
+                    INNER JOIN {table} f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
+                    WHERE {where}
+                """), params).scalar()
+                return jsonify({"count": count})
+
+            extra_cols = ""
+            if source == "claude":
+                extra_cols = ", f.affected_tokens, f.action_hint, f.is_signal, f.cross_refs, f.analysis_mode"
+            query = f"""
+                SELECT m.message_id, m.chat_id, m.chat_title, m.sender_name,
+                       m.text, m.date,
+                       f.sentiment, f.sentiment_label, f.event_type, f.scope,
+                       f.intensity, f.urgency, f.reasoning{extra_cols}
+                FROM messages m
+                INNER JOIN {table} f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
+                WHERE {where}
+                ORDER BY m.date DESC
+            """
+            for row in conn.execute(sql_text(query), params):
+                item = {
+                    "message_id": row.message_id,
+                    "chat_id": row.chat_id,
+                    "chat_title": row.chat_title,
+                    "sender_name": row.sender_name,
+                    "text": row.text,
+                    "date": row.date.isoformat() if row.date else None,
+                    "sentiment": row.sentiment,
+                    "sentiment_label": row.sentiment_label,
+                    "event_type": row.event_type,
+                    "scope": row.scope,
+                    "intensity": row.intensity,
+                    "urgency": row.urgency,
+                    "reasoning": row.reasoning,
+                }
+                if source == "claude":
+                    item["affected_tokens"] = json.loads(row.affected_tokens) if row.affected_tokens else []
+                    item["action_hint"] = row.action_hint
+                    item["is_signal"] = bool(row.is_signal) if row.is_signal is not None else None
+                    item["cross_refs"] = json.loads(row.cross_refs) if row.cross_refs else []
+                    item["analysis_mode"] = row.analysis_mode
+                rows.append(item)
+
+    if fmt == "csv":
+        import csv
+        import io
+        output = io.StringIO()
+        # Determine columns based on source
+        if source == "both":
+            columns = ["message_id", "chat_id", "chat_title", "sender_name", "date", "text",
+                        "claude_sentiment", "claude_sentiment_label", "claude_event_type",
+                        "claude_scope", "claude_intensity", "claude_urgency",
+                        "claude_action_hint", "claude_is_signal", "claude_reasoning",
+                        "ds_sentiment", "ds_sentiment_label", "ds_event_type", "ds_reasoning"]
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            for r in rows:
+                writer.writerow([
+                    r["message_id"], r["chat_id"], r["chat_title"], r["sender_name"],
+                    r["date"], (r["text"] or "").replace("\n", "\\n"),
+                    r["claude"]["sentiment"], r["claude"]["sentiment_label"],
+                    r["claude"]["event_type"], r["claude"]["scope"],
+                    r["claude"]["intensity"], r["claude"]["urgency"],
+                    r["claude"]["action_hint"], r["claude"]["is_signal"],
+                    r["claude"]["reasoning"],
+                    r["deepseek"]["sentiment"] if r["deepseek"] else "",
+                    r["deepseek"]["sentiment_label"] if r["deepseek"] else "",
+                    r["deepseek"]["event_type"] if r["deepseek"] else "",
+                    r["deepseek"]["reasoning"] if r["deepseek"] else "",
+                ])
+        else:
+            base_cols = ["message_id", "chat_id", "chat_title", "sender_name", "date", "text",
+                         "sentiment", "sentiment_label", "event_type", "scope",
+                         "intensity", "urgency", "reasoning"]
+            if source == "claude":
+                base_cols += ["affected_tokens", "action_hint", "is_signal", "analysis_mode"]
+            writer = csv.writer(output)
+            writer.writerow(base_cols)
+            for r in rows:
+                vals = [r["message_id"], r["chat_id"], r["chat_title"], r["sender_name"],
+                        r["date"], (r["text"] or "").replace("\n", "\\n"),
+                        r["sentiment"], r["sentiment_label"], r["event_type"], r["scope"],
+                        r["intensity"], r["urgency"], r["reasoning"]]
+                if source == "claude":
+                    vals += [",".join(r.get("affected_tokens", [])),
+                             r["action_hint"], r["is_signal"], r["analysis_mode"]]
+                writer.writerow(vals)
+        return Response(output.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=signals_export.csv"})
+
+    if fmt == "markdown":
+        lines = ["# 信号分析导出\n"]
+        meta_parts = []
+        if chat_id:
+            chat_title = rows[0].get("chat_title", "") if rows else ""
+            meta_parts.append(f"群组: {chat_title}" if chat_title else f"群组ID: {chat_id}")
+        else:
+            meta_parts.append("群组: 全部")
+        if date_from:
+            meta_parts.append(f"起始: {date_from}")
+        if date_to:
+            meta_parts.append(f"结束: {date_to}")
+        source_label = {"claude": "Claude", "deepseek": "DeepSeek", "both": "Claude+DeepSeek"}
+        meta_parts.append(f"来源: {source_label.get(source, source)}")
+        if signal_only:
+            meta_parts.append("仅信号")
+        meta_parts.append(f"共 {len(rows)} 条")
+        lines.append(" | ".join(meta_parts))
+        lines.append("")
+
+        for r in rows:
+            date_str = (r.get("date") or "-").replace("T", " ")[:16]
+            sender = r.get("sender_name") or "未知"
+            chat_tag = f" [{r.get('chat_title', '')}]" if not chat_id and r.get("chat_title") else ""
+            lines.append(f"### [{date_str}] {sender}{chat_tag}")
+
+            text = r.get("text") or ""
+            if text:
+                lines.append(f"> {text}")
+            lines.append("")
+
+            if source == "both":
+                c = r["claude"]
+                lines.append(f"**Claude**: {c['sentiment_label']} | {c['event_type']} | "
+                             f"强度{c['intensity']} | 紧急{c['urgency']} | "
+                             f"信号={'是' if c['is_signal'] else '否'} | "
+                             f"建议:{c['action_hint'] or '-'}")
+                if c["reasoning"]:
+                    lines.append(f"  推理: {c['reasoning']}")
+                d = r["deepseek"]
+                if d:
+                    lines.append(f"**DeepSeek**: {d['sentiment_label']} | {d['event_type']} | "
+                                 f"强度{d['intensity']} | 紧急{d['urgency']}")
+                    if d["reasoning"]:
+                        lines.append(f"  推理: {d['reasoning']}")
+            else:
+                sentiment_map = {"bullish": "看涨", "neutral": "中性", "bearish": "看跌"}
+                sl = sentiment_map.get(r["sentiment_label"], r["sentiment_label"])
+                event_map = {"regulatory": "监管", "macro": "宏观", "exploit": "安全",
+                             "listing": "上线", "partnership": "合作", "governance": "治理",
+                             "market": "市场", "other": "其他"}
+                et = event_map.get(r["event_type"], r["event_type"])
+                lines.append(f"**{sl}** | {et} | {r['scope']} | "
+                             f"强度{r['intensity']} | 紧急{r['urgency']}")
+                if source == "claude":
+                    lines.append(f"  信号={'是' if r.get('is_signal') else '否'} | "
+                                 f"建议:{r.get('action_hint', '-')} | "
+                                 f"代币:{','.join(r.get('affected_tokens', [])) or '-'}")
+                if r["reasoning"]:
+                    lines.append(f"  推理: {r['reasoning']}")
+
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        return Response("\n".join(lines), mimetype="text/markdown",
+                        headers={"Content-Disposition": "attachment; filename=signals_export.md"})
+
+    return jsonify(rows)
+
+
 @api.route("/config/groups/<int:chat_id>", methods=["DELETE"])
 @require_auth
 def delete_group(chat_id):

@@ -359,6 +359,59 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
   </div>
 </div>
 
+<!-- SIGNAL EXPORT MODAL -->
+<div class="modal-overlay" id="signalExportModal" style="display:none">
+  <div class="modal-panel" style="width:440px">
+    <h2>导出信号分析</h2>
+    <div class="export-section">
+      <div class="export-section__label">群组</div>
+      <select class="export-group-select" id="signalExportGroupSelect" onchange="updateSignalExportPreview()">
+        <option value="">全部群组</option>
+      </select>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">快捷日期</div>
+      <div class="export-quick-dates">
+        <button class="export-quick-btn" data-preset="today" onclick="setSignalExportQuickDate('today')">今天</button>
+        <button class="export-quick-btn" data-preset="yesterday" onclick="setSignalExportQuickDate('yesterday')">昨天</button>
+        <button class="export-quick-btn" data-preset="7d" onclick="setSignalExportQuickDate('7d')">近7天</button>
+        <button class="export-quick-btn" data-preset="30d" onclick="setSignalExportQuickDate('30d')">近30天</button>
+        <button class="export-quick-btn" data-preset="this_month" onclick="setSignalExportQuickDate('this_month')">本月</button>
+        <button class="export-quick-btn" data-preset="last_month" onclick="setSignalExportQuickDate('last_month')">上月</button>
+      </div>
+      <div class="export-date-row">
+        <input type="date" id="signalExportDateFrom" class="export-date-input" onchange="clearSignalExportQuickDate();updateSignalExportPreview()">
+        <span class="export-date-sep">至</span>
+        <input type="date" id="signalExportDateTo" class="export-date-input" onchange="clearSignalExportQuickDate();updateSignalExportPreview()">
+      </div>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">分析来源</div>
+      <div class="export-format-row">
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="claude" checked onchange="updateSignalExportPreview()"> Claude</label>
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="deepseek" onchange="updateSignalExportPreview()"> DeepSeek</label>
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="both" onchange="updateSignalExportPreview()"> 对比</label>
+      </div>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">格式</div>
+      <div class="export-format-row">
+        <label class="export-format-label"><input type="radio" name="signalExportFormat" value="json" checked onchange="updateSignalExportPreview()"> JSON</label>
+        <label class="export-format-label"><input type="radio" name="signalExportFormat" value="csv" onchange="updateSignalExportPreview()"> CSV</label>
+        <label class="export-format-label"><input type="radio" name="signalExportFormat" value="markdown" onchange="updateSignalExportPreview()"> Markdown</label>
+      </div>
+    </div>
+    <div class="export-section">
+      <label class="export-format-label"><input type="checkbox" id="signalExportSignalOnly" checked onchange="updateSignalExportPreview()"> 仅导出信号（排除噪音）</label>
+    </div>
+    <div class="export-preview" id="signalExportPreview">选择日期范围后显示信号数量</div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeSignalExportModal()">取消</button>
+      <button class="btn btn-cyan" onclick="doSignalExport()">导出</button>
+    </div>
+  </div>
+</div>
+
 <!-- MAIN APP -->
 <div id="app" style="display:none;flex-direction:column;height:100vh">
 
@@ -514,6 +567,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
           <h2 style="font-size:var(--fs-lg);font-weight:600">信号分析</h2>
           <button class="btn btn-cyan" id="btnSignalProcess" onclick="startSignalProcess()" style="font-size:var(--fs-xs);padding:2px 8px;margin-left:8px">处理全部</button>
           <button class="btn" id="btnSignalStop" onclick="stopSignalProcess()" style="font-size:var(--fs-xs);padding:2px 8px;display:none">停止</button>
+          <button class="btn" onclick="openSignalExportModal()" style="font-size:var(--fs-xs);padding:2px 8px;margin-left:auto">导出</button>
           <span id="signalProgress" style="font-size:var(--fs-xs);color:var(--text-2);margin-left:8px"></span>
         </div>
         <div class="dashboard-body">
