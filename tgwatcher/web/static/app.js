@@ -39,6 +39,8 @@ async function api(path,opts={}){
     return await r.json()}catch(e){if(e.name==='AbortError')showToast('请求超时 — 请检查服务器','error');else console.error('API error:',e);return null}
 }
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function fmtTime(iso){if(!iso)return'-';const d=new Date(iso+'Z');if(isNaN(d))return iso;const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'),h=String(d.getHours()).padStart(2,'0'),mi=String(d.getMinutes()).padStart(2,'0');return `${y}-${m}-${day} ${h}:${mi}`}
+function fmtTimeShort(iso){if(!iso)return'--:--';const d=new Date(iso+'Z');if(isNaN(d))return iso;return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
 
 // ===== LOGIN =====
 function showLoginStep(step){for(let i=0;i<=3;i++)document.getElementById('loginStep'+i).classList.toggle('active',i===step)}
@@ -170,10 +172,10 @@ async function loadMessages(page=1){
   if(!msgs.length){tbody.innerHTML='<tr><td colspan="4" style="text-align:center;padding:40px;color:var(--text-3)">暂无消息。请添加群组并开始爬取。</td></tr>'}
   else{tbody.innerHTML=msgs.map(m=>{
     const t=esc(m.text||'');const ts=t.length>80?t.slice(0,80)+'...':t;
-    const fullDate=m.date?m.date.replace('T',' ').slice(0,16):'-';
-    const today=new Date().toISOString().slice(0,10);
-    const msgDay=m.date?m.date.slice(0,10):'';
-    const displayDate=msgDay===today?fullDate.slice(11):fullDate;
+    const fullDate=fmtTime(m.date);
+    const today=new Date();const todayStr=today.getFullYear()+'-'+String(today.getMonth()+1).padStart(2,'0')+'-'+String(today.getDate()).padStart(2,'0');
+    const msgDay=m.date?fmtTime(m.date).slice(0,10):'';
+    const displayDate=msgDay===todayStr?fullDate.slice(11):fullDate;
     const med=m.media_type?{'photo':'图','video':'视频','document':'文档','sticker':'贴纸','audio':'音频','voice':'语音','webpage':'链接','contact':'联系人'}[m.media_type]||'媒体':(m.has_media?'文件':'');
     const medTag=med?`<span class="col-media">${med}</span>`:'';
     const editTag=m.is_edited?'<span style="color:var(--text-3);font-size:10px;margin-right:3px">已编辑</span>':'';
@@ -203,7 +205,7 @@ async function loadReply(msgId,el){
   if(!r||r.error){el.textContent='未找到';return}
   const div=document.createElement('div');
   div.style.cssText='margin-top:4px;padding:6px;background:var(--bg-0);border:1px solid var(--border);font-size:var(--fs-xs);line-height:1.5;color:var(--text-1);max-width:400px';
-  div.innerHTML='<b>'+esc(r.sender_name||'?')+'</b> <span style="color:var(--text-3)">'+(r.date?r.date.replace('T',' ').slice(0,16):'')+'</span><br>'+esc(r.text||'').slice(0,300);
+  div.innerHTML='<b>'+esc(r.sender_name||'?')+'</b> <span style="color:var(--text-3)">'+fmtTime(r.date)+'</span><br>'+esc(r.text||'').slice(0,300);
   el.after(div);el.onclick=()=>div.remove();
 }
 
@@ -352,7 +354,7 @@ async function loadDashboardTab(){
   document.getElementById('kpiAvgDay').textContent=avg.toLocaleString();
   const cs=await api('/api/crawl/status');
   const lastCrawl=cs?.last_crawl_at||s.latest_message;
-  document.getElementById('kpiLastCrawl').textContent=lastCrawl?lastCrawl.replace('T',' ').slice(11,16):'--:--';
+  document.getElementById('kpiLastCrawl').textContent=lastCrawl?fmtTimeShort(lastCrawl):'--:--';
   loadTrendChart();loadHeatmap();loadComparisonChart();
 }
 
@@ -408,7 +410,7 @@ async function loadGroupsView(){
     <td style="font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-2)">${c.chat_type==='channel'?'频道':c.chat_type||'-'}</td>
     <td class="col-num">${c.members||'-'}</td>
     <td class="col-num">${c.msg_count}</td>
-    <td class="col-time">${c.last_msg_date?c.last_msg_date.replace('T',' ').slice(0,16):'-'}</td>
+    <td class="col-time">${fmtTime(c.last_msg_date)}</td>
     <td><label class="toggle-switch"><input type="checkbox" ${checked} onchange="toggleAutoCatchup(${c.chat_id},this.checked)"><span class="toggle-slider"></span></label></td>
     <td><button class="btn btn-danger" style="font-size:var(--fs-xs);padding:1px 6px" onclick="removeGroup(${c.chat_id})">✕</button></td>
   </tr>`}).join('');
@@ -532,7 +534,7 @@ function updateCrawlUI(s){
     modeEl.style.display='';btnStart.style.display='';btnStop.style.display='none';
     progress.style.width='0%';progress.classList.remove('running');
     if(s.error)detail.textContent='错误: '+s.error.slice(0,60);
-    else if(s.last_crawl_at)detail.textContent='上次: '+s.last_crawl_at.replace('T',' ').slice(0,16);
+    else if(s.last_crawl_at)detail.textContent='上次: '+fmtTime(s.last_crawl_at);
     else detail.textContent='暂无爬取数据';
     counts.textContent='';
     meta.textContent='';
@@ -700,7 +702,7 @@ async function loadSignalTable(){
     const sentText=f.sentiment_label==='bullish'?'看涨':f.sentiment_label==='bearish'?'看跌':'中性';
     const scopeText=f.scope==='macro'?'宏观':'微观';
     const text=(f.text||'').slice(0,60);
-    const date=f.date?f.date.slice(0,16):'';
+    const date=fmtTime(f.date);
     return `<tr><td style="white-space:nowrap">${date}</td><td style="color:${sentColor}">${sentText}</td><td>${f.event_type||'-'}</td><td>${scopeText}</td><td>${f.intensity||'-'}</td><td>${f.urgency||'-'}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text}</td></tr>`;
   }).join('');
 }
