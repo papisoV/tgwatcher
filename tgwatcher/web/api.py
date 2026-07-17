@@ -477,10 +477,10 @@ def export_signals():
                 params["chat_id"] = chat_id
             if df:
                 where_clauses.append("m.date >= :df")
-                params["df"] = df
+                params["df"] = df.isoformat()
             if dt:
                 where_clauses.append("m.date <= :dt")
-                params["dt"] = dt
+                params["dt"] = dt.isoformat()
             if signal_only:
                 where_clauses.append("cf.is_signal = 1")
 
@@ -520,7 +520,7 @@ def export_signals():
                     "chat_title": row.chat_title,
                     "sender_name": row.sender_name,
                     "text": row.text,
-                    "date": row.date.isoformat() if row.date else None,
+                    "date": row.date.isoformat() if isinstance(row.date, datetime) else (str(row.date) if row.date else None),
                     "claude": {
                         "sentiment": row.claude_sentiment,
                         "sentiment_label": row.claude_sentiment_label,
@@ -553,10 +553,10 @@ def export_signals():
                 params["chat_id"] = chat_id
             if df:
                 where_clauses.append("m.date >= :df")
-                params["df"] = df
+                params["df"] = df.isoformat()
             if dt:
                 where_clauses.append("m.date <= :dt")
-                params["dt"] = dt
+                params["dt"] = dt.isoformat()
             where_clauses.append(f"f.llm_status = 'completed'")
             if signal_only and source == "claude":
                 where_clauses.append("f.is_signal = 1")
@@ -591,7 +591,7 @@ def export_signals():
                     "chat_title": row.chat_title,
                     "sender_name": row.sender_name,
                     "text": row.text,
-                    "date": row.date.isoformat() if row.date else None,
+                    "date": row.date.isoformat() if isinstance(row.date, datetime) else (str(row.date) if row.date else None),
                     "sentiment": row.sentiment,
                     "sentiment_label": row.sentiment_label,
                     "event_type": row.event_type,
