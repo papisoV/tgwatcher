@@ -11,6 +11,7 @@ if sys.platform == "win32":
 
 USAGE = """
 Usage:
+  python tg_analyze_helper.py preanalyze <db_path> [--count N] [--chat-id ID] [--from DATE] [--to DATE] [--overwrite] [--all]
   python tg_analyze_helper.py fetch <db_path> [--count N] [--chat-id ID] [--from DATE] [--to DATE] [--overwrite] [--all] [--noise-stats]
   python tg_analyze_helper.py write <db_path> <results_json_file> [--mode factor|timeline|theme|deep]
   python tg_analyze_helper.py stats <db_path>
@@ -26,6 +27,11 @@ NOISE_PATTERNS: dict[str, list[str]] = {
         "创历史新高", "创年内新低", "创历史新低",
         "涨幅%", "跌幅%", "涨%", "跌%",
         "24h涨", "24h跌", "24H涨", "24H跌",
+        # Chinese price patterns
+        "突破.*美元", "跌破.*美元", "站上.*美元",
+        "价格突破", "价格跌破",
+        "比特币价格", "BTC价格",
+        "价值.*美元的比特币", "价值.*美元的以太",
     ],
     "etf_flow": [
         "ETF流入", "ETF流出", "资金净流入", "资金净流出",
@@ -43,6 +49,18 @@ NOISE_PATTERNS: dict[str, list[str]] = {
         "恐惧贪婪指数", "多空比", "资金费率",
         "持仓量变化", "清算数据", "爆仓",
         "未平仓合约", "OI变化",
+        # Chinese routine data patterns
+        "空头头寸被清算", "多头头寸被清算",
+        "标普.*指数.*上涨", "标普.*指数.*下跌",
+        "纳斯达克指数.*上涨", "纳斯达克指数.*下跌",
+        "指数收盘", "指数开盘",
+        "原油库存", "制造业指数",
+    ],
+    "stock_news": [
+        # Non-crypto stock news that shouldn't be crypto signals
+        "股价.*跌破", "股价.*突破",
+        "IPO发行价", "可转换优先",
+        "CONV SR", "票据到期",
     ],
 }
 
@@ -59,6 +77,232 @@ MACRO_SIGNAL_KEYWORDS: list[str] = [
     "银行", "破产", "救助", "系统性风险",
     "欧央行", "BOJ", "日本央行", "英国央行",
 ]
+
+
+# ── Text deduplication ──────────────────────────────────────────────
+def _dedup_tradfin_translation(text: str) -> str:
+    """
+    Remove duplicate Chinese translation block from Tradfin messages.
+
+    Pattern: **Tradfin：...content...**\\nTradfin：...same content in Chinese...
+    The second block is a machine translation of the first and adds no value.
+    Also strips separator lines (————————————).
+    """
+    if not text or "Tradfin" not in text:
+        return text
+
+    # Strip separator lines
+    text = re.sub(r'—{5,}', '', text)
+
+    # Pattern: bold section ends with **, newline, then Tradfin： starts translation
+    parts = re.split(r'\*\*\s*\n(?=Tradfin[：:])', text, maxsplit=1)
+    if len(parts) == 2:
+        result = parts[0].strip()
+        result = re.sub(r'^\*\*', '', result).strip()
+        result = re.sub(r'\*\*$', '', result).strip()
+        return result
+
+    # Fallback: remove everything from second Tradfin： line onward
+    lines = text.split('\n')
+    seen_tradfin = False
+    kept_lines = []
+    for line in lines:
+        if re.match(r'^Tradfin[：:]', line.strip()):
+            if seen_tradfin:
+                break
+            seen_tradfin = True
+        kept_lines.append(line)
+    return '\n'.join(kept_lines) if len(kept_lines) < len(lines) else text
+
+
+# ── Token extraction ────────────────────────────────────────────────
+TOKEN_PATTERN = re.compile(
+    r'\$([A-Z]{2,10})'
+    r'|(?<!\w)(BTC|ETH|SOL|BNB|XRP|ADA|DOGE|AVAX|DOT|MATIC|LINK|UNI|AAVE|ARB|OP|APT|SUI|SEI|NEAR|FTM|ATOM|FIL|INJ|TIA|JUP|WIF|PEPE|SHIB|TRUMP|DJT)(?!\w)'
+)
+
+# ── Category-to-factor mapping ──────────────────────────────────────
+CATEGORY_FACTOR_MAP: dict[str, dict] = {
+    "event_regulatory": {
+        "event_type": "regulatory", "scope": "macro",
+        "sentiment": 2, "intensity": 4, "urgency": 4, "action_hint": "hedge",
+    },
+    "event_macro": {
+        "event_type": "macro", "scope": "macro",
+        "sentiment": 3, "intensity": 4, "urgency": 3, "action_hint": "watch",
+    },
+    "event_exploit": {
+        "event_type": "exploit", "scope": "micro",
+        "sentiment": 1, "intensity": 5, "urgency": 5, "action_hint": "short",
+    },
+    "event_listing": {
+        "event_type": "listing", "scope": "micro",
+        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "watch",
+    },
+    "event_partnership": {
+        "event_type": "partnership", "scope": "micro",
+        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "watch",
+    },
+    "bullish": {
+        "event_type": "market", "scope": "micro",
+        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "long",
+    },
+    "bearish": {
+        "event_type": "market", "scope": "micro",
+        "sentiment": 2, "intensity": 3, "urgency": 2, "action_hint": "short",
+    },
+    "scope_macro": {"scope": "macro"},
+    "scope_micro": {"scope": "micro"},
+    "urgency_high": {"urgency": 5, "intensity": 4},
+}
+
+
+def _extract_tokens(text: str) -> list[str]:
+    """Extract crypto token symbols from text."""
+    tokens: set[str] = set()
+    for match in TOKEN_PATTERN.finditer(text):
+        token = match.group(1) or match.group(2)
+        if token:
+            tokens.add(token.upper())
+    return sorted(tokens)
+
+
+def _compute_sentiment_label(sentiment: int) -> str:
+    """Compute sentiment label from numeric value."""
+    if sentiment <= 2:
+        return "bearish"
+    if sentiment == 3:
+        return "neutral"
+    return "bullish"
+
+
+def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
+    """
+    Pre-analyze a single message using local rules.
+
+    Returns a factor dict with is_signal, pre-filled factor values,
+    and a confidence field ("high" = no Claude review needed, "low" = review).
+    """
+    from tgwatcher.signal_filter import KeywordFilter, DEFAULT_KEYWORD_RULES
+
+    clean_text = _dedup_tradfin_translation(text)
+
+    # Step 1: Check if high-confidence noise (price quotes, routine data, etc.)
+    is_noise, noise_reason = _is_likely_noise(clean_text)
+
+    # Step 2: Run keyword filter
+    kf = KeywordFilter({"keywords": DEFAULT_KEYWORD_RULES})
+    filter_result = kf.filter(clean_text)
+
+    # Determine if keyword filter found a "strong" signal category
+    categories = filter_result.preliminary_factors.get("matched_categories", [])
+    has_strong_signal = any(c in ("event_regulatory", "event_macro", "event_exploit") for c in categories)
+
+    # Noise classification logic:
+    # - No keyword match at all → noise
+    # - Noise pattern matched AND no strong signal category → noise
+    #   (e.g., "标普500上涨0.4%" matches bullish/上涨 but is just market data)
+    # - Noise pattern matched BUT strong signal present → borderline, keep as signal candidate
+    # - No noise pattern, keyword match → signal candidate
+    is_definite_noise = (not filter_result.passed) or (is_noise and not has_strong_signal)
+
+    if is_definite_noise:
+        return {
+            "message_id": msg_id,
+            "chat_id": chat_id,
+            "is_signal": False,
+            "sentiment": 3,
+            "sentiment_label": "neutral",
+            "event_type": "market",
+            "scope": "micro",
+            "intensity": 1,
+            "urgency": 1,
+            "action_hint": "none",
+            "affected_tokens": [],
+            "reasoning": f"noise: {noise_reason}, no strong signal category" if is_noise else "noise: no signal keywords matched",
+            "confidence": "high",
+            "matched_categories": [],
+            "matched_keywords": filter_result.matched_keywords,
+        }
+
+    # Even if keyword filter passed, check if it's noise with macro override
+    # e.g., "特朗普硬币视频" matches "特朗普" but is just a meme, not a signal
+    # If the ONLY match is from MACRO_SIGNAL_KEYWORDS and noise pattern also matched,
+    # classify as low-confidence signal (Claude will review)
+    categories = filter_result.preliminary_factors.get("matched_categories", [])
+
+    # Signal candidate — build pre-filled factors from categories
+    factors: dict = {
+        "message_id": msg_id,
+        "chat_id": chat_id,
+        "is_signal": True,
+        "sentiment": 3,
+        "sentiment_label": "neutral",
+        "event_type": "other",
+        "scope": "micro",
+        "intensity": 3,
+        "urgency": 3,
+        "action_hint": "watch",
+        "affected_tokens": _extract_tokens(clean_text),
+        "reasoning": "",
+        "confidence": "low",
+        "matched_categories": categories,
+        "matched_keywords": filter_result.matched_keywords,
+    }
+
+    # If noise pattern also matched, mark as low-confidence (Claude should double-check)
+    if is_noise:
+        factors["confidence"] = "low"
+        factors["reasoning"] = f"borderline: noise pattern ({noise_reason}) but signal keywords present"
+
+    # Merge category-specific overrides
+    for cat in categories:
+        if cat in CATEGORY_FACTOR_MAP:
+            for key, val in CATEGORY_FACTOR_MAP[cat].items():
+                factors[key] = val
+
+    # Primary event_type from most specific event category
+    event_cats = [c for c in categories if c.startswith("event_")]
+    if event_cats:
+        primary = event_cats[0]
+        if primary in CATEGORY_FACTOR_MAP:
+            factors["event_type"] = CATEGORY_FACTOR_MAP[primary]["event_type"]
+
+    # Override scope if scope_* categories present
+    scope_cats = [c for c in categories if c.startswith("scope_")]
+    if scope_cats:
+        last_scope = scope_cats[-1]
+        if last_scope in CATEGORY_FACTOR_MAP and "scope" in CATEGORY_FACTOR_MAP[last_scope]:
+            factors["scope"] = CATEGORY_FACTOR_MAP[last_scope]["scope"]
+
+    # Override urgency if urgency_high present
+    if "urgency_high" in categories:
+        factors["urgency"] = 5
+        factors["intensity"] = max(factors.get("intensity", 3), 4)
+
+    # Compute sentiment_label from final sentiment
+    factors["sentiment_label"] = _compute_sentiment_label(factors["sentiment"])
+
+    # Macro events with no specific tokens → empty affected_tokens
+    if factors["scope"] == "macro" and factors["event_type"] in ("macro", "regulatory"):
+        factors["affected_tokens"] = []
+
+    # Auto-reasoning from matched categories
+    if not factors["reasoning"]:
+        cat_labels = {
+            "event_regulatory": "监管事件",
+            "event_macro": "宏观经济",
+            "event_exploit": "安全事件",
+            "event_listing": "上线事件",
+            "event_partnership": "合作事件",
+            "bullish": "利好信号",
+            "bearish": "利空信号",
+        }
+        labels = [cat_labels.get(c, c) for c in categories if c in cat_labels]
+        if labels:
+            factors["reasoning"] = f"预分类: {'+'.join(labels)}; 关键词: {','.join(filter_result.matched_keywords[:5])}"
+
+    return factors
 
 
 def _is_likely_noise(text: str) -> tuple[bool, str]:
@@ -80,11 +324,19 @@ def _is_likely_noise(text: str) -> tuple[bool, str]:
     # Check noise patterns
     for category, patterns in NOISE_PATTERNS.items():
         for pattern in patterns:
-            # Handle $ as end-of-number marker (e.g., "突破$60000")
             if "$" in pattern:
+                # Dollar-sign patterns: $ means "digit" (e.g., "突破$60000")
                 regex_pattern = pattern.replace("$", r"\d")
                 if re.search(regex_pattern, text):
                     return True, f"noise:{category}"
+            elif ".*" in pattern or "%" in pattern:
+                # Regex patterns (e.g., "突破.*美元", "涨幅%")
+                try:
+                    if re.search(pattern, text):
+                        return True, f"noise:{category}"
+                except re.error:
+                    if pattern.lower() in text_lower:
+                        return True, f"noise:{category}"
             else:
                 if pattern.lower() in text_lower:
                     return True, f"noise:{category}"
@@ -101,8 +353,132 @@ def _get_storage(db_path: str):
     return Storage(db_path)
 
 
+def cmd_preanalyze(db_path: str, args: list[str]):
+    """Pre-analyze messages: local rule engine fills factors, output separates noise from signal candidates."""
+    from sqlalchemy import text
+    storage = _get_storage(db_path)
+
+    # Parse args
+    count = 100
+    chat_id = None
+    date_from = None
+    date_to = None
+    overwrite = False
+    include_all = False
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--count" and i + 1 < len(args):
+            count = int(args[i + 1]); i += 2
+        elif args[i] == "--chat-id" and i + 1 < len(args):
+            chat_id = int(args[i + 1]); i += 2
+        elif args[i] == "--from" and i + 1 < len(args):
+            date_from = args[i + 1]; i += 2
+        elif args[i] == "--to" and i + 1 < len(args):
+            date_to = args[i + 1]; i += 2
+        elif args[i] == "--overwrite":
+            overwrite = True; i += 1
+        elif args[i] == "--all":
+            include_all = True; i += 1
+        else:
+            i += 1
+
+    # Fetch messages
+    from datetime import datetime
+    from tgwatcher.tz_utils import local_to_utc, utc_to_local
+    df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
+    dt = None
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        dt = local_to_utc(dt_local)
+
+    fetch_count = count * 2
+    result = storage.query_messages(
+        chat_id=chat_id, date_from=df, date_to=dt,
+        page=1, page_size=fetch_count,
+    )
+    messages = result["messages"]
+
+    # Filter out already-analyzed (unless overwrite)
+    if not overwrite and messages:
+        with storage.engine.connect() as conn:
+            pairs = [(m["message_id"], m["chat_id"]) for m in messages]
+            chunk_size = 900
+            existing_ids: set[tuple[int, int]] = set()
+            for c_start in range(0, len(pairs), chunk_size):
+                chunk = pairs[c_start:c_start + chunk_size]
+                placeholders = ", ".join(f"(:mid{j}, :cid{j})" for j in range(len(chunk)))
+                params = {}
+                for j, (mid, cid) in enumerate(chunk):
+                    params[f"mid{j}"] = mid
+                    params[f"cid{j}"] = cid
+                rows = conn.execute(text(
+                    f"SELECT message_id, chat_id FROM claude_factors "
+                    f"WHERE (message_id, chat_id) IN ({placeholders}) "
+                    f"AND llm_status='completed'"
+                ), params).fetchall()
+                for row in rows:
+                    existing_ids.add((row[0], row[1]))
+        messages = [m for m in messages if (m["message_id"], m["chat_id"]) not in existing_ids]
+
+    messages = messages[:count]
+
+    # Run pre-analysis on each message
+    noise_results: list[dict] = []
+    signal_candidates: list[dict] = []
+
+    for m in messages:
+        text = m.get("text") or ""
+        pre = _preanalyze_message(text, m["message_id"], m["chat_id"])
+
+        # Add metadata for display (convert UTC to local time)
+        date_val = m.get("date")
+        if date_val:
+            try:
+                pre["date"] = utc_to_local(datetime.fromisoformat(date_val)).isoformat()[:16]
+            except (ValueError, TypeError):
+                pre["date"] = date_val[:16]
+        else:
+            pre["date"] = ""
+        pre["chat_title"] = m.get("chat_title") or ""
+        pre["text_compressed"] = _dedup_tradfin_translation(text[:300])
+        pre["text_original_length"] = len(text)
+
+        if not pre["is_signal"] and not include_all:
+            noise_results.append(pre)
+        else:
+            signal_candidates.append(pre)
+
+    # Build compact display for Claude — only signal candidates
+    signal_lines = []
+    for idx, s in enumerate(signal_candidates):
+        line = (
+            f"[{idx}] msg={s['message_id']} chat={s['chat_id']} | "
+            f"{s['date']} | {s['chat_title']}\n"
+            f"  Text: {s['text_compressed']}\n"
+            f"  Pre: event={s['event_type']} sent={s['sentiment']}({s['sentiment_label']}) "
+            f"scope={s['scope']} int={s['intensity']} urg={s['urgency']} "
+            f"hint={s['action_hint']} tokens={s['affected_tokens']}\n"
+            f"  Reason: {s['reasoning']}"
+        )
+        signal_lines.append(line)
+
+    output = {
+        "signal_candidates": signal_candidates,
+        "noise_count": len(noise_results),
+        "noise_results": noise_results,
+        "signal_display": "\n".join(signal_lines),
+        "total_fetched": len(messages),
+        "total_available": result["total"],
+    }
+
+    print(json.dumps(output, ensure_ascii=False, default=str))
+
+
 def cmd_init(db_path: str):
-    """Create claude_factors table if not exists."""
+    """Create claude_factors table if not exists, and migrate missing columns."""
     from sqlalchemy import text
     storage = _get_storage(db_path)
     with storage.engine.connect() as conn:
@@ -132,6 +508,12 @@ def cmd_init(db_path: str):
                 UNIQUE(message_id, chat_id)
             )
         """))
+        # Migrate: add is_signal column if missing (older tables)
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(claude_factors)"))]
+        if "is_signal" not in cols:
+            conn.execute(text("ALTER TABLE claude_factors ADD COLUMN is_signal BOOLEAN DEFAULT 1"))
+        if "analysis_mode" not in cols:
+            conn.execute(text("ALTER TABLE claude_factors ADD COLUMN analysis_mode VARCHAR(16)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_chat_id ON claude_factors(chat_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_action_hint ON claude_factors(action_hint)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_is_signal ON claude_factors(is_signal)"))
@@ -177,10 +559,14 @@ def cmd_fetch(db_path: str, args: list[str]):
     # Request more than needed so we still get ~count after filtering
     fetch_count = count * 3 if not include_all else count
     from datetime import datetime
-    df = datetime.fromisoformat(date_from) if date_from else None
-    dt = datetime.fromisoformat(date_to) if date_to else None
-    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=23, minute=59, second=59)
+    from tgwatcher.tz_utils import local_to_utc, utc_to_local
+    df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
+    dt = None
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        dt = local_to_utc(dt_local)
 
     result = storage.query_messages(
         chat_id=chat_id, date_from=df, date_to=dt,
@@ -248,7 +634,14 @@ def cmd_fetch(db_path: str, args: list[str]):
         text = m.get("text") or ""
         if len(text) > 500:
             text = text[:500] + "..."
-        date_str = (m.get("date") or "")[:16]
+        date_val = m.get("date")
+        if date_val:
+            try:
+                date_str = utc_to_local(datetime.fromisoformat(date_val)).isoformat()[:16]
+            except (ValueError, TypeError):
+                date_str = date_val[:16]
+        else:
+            date_str = ""
         chat_title = m.get("chat_title") or ""
         formatted_lines.append(
             f"[{i}] msg_id={m['message_id']} chat_id={m['chat_id']} | "
@@ -417,6 +810,9 @@ def cmd_stats(db_path: str):
 
 
 def main():
+    from tgwatcher.tz_utils import set_tz_offset
+    set_tz_offset(8)  # Default UTC+8; matches config.yaml default
+
     if len(sys.argv) < 3:
         print(USAGE)
         sys.exit(1)
@@ -427,6 +823,8 @@ def main():
 
     if command == "init":
         cmd_init(db_path)
+    elif command == "preanalyze":
+        cmd_preanalyze(db_path, rest_args)
     elif command == "fetch":
         cmd_fetch(db_path, rest_args)
     elif command == "write":

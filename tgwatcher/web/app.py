@@ -24,6 +24,9 @@ def create_app(config_path: str | None = None) -> Flask:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    from tgwatcher.tz_utils import set_tz_offset
+    set_tz_offset(config.get("timezone", {}).get("utc_offset_hours", 8))
+
     static_dir = Path(__file__).resolve().parent / "static"
     app = Flask(__name__, static_folder=str(static_dir))
     app.register_blueprint(api)

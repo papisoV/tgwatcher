@@ -20,6 +20,7 @@ from tgwatcher.signal_filter import KeywordFilter
 from tgwatcher.signal_llm import SignalLLMClient
 from tgwatcher.signal_engine import SignalEngine
 from tgwatcher.web.signal_service import SignalService
+from tgwatcher.tz_utils import local_to_utc
 
 logger = logging.getLogger(__name__)
 
@@ -307,10 +308,13 @@ def get_messages():
         return jsonify({"error": "Keyword too long (max 200 characters)"}), 400
     page_size = max(1, min(page_size, 200))
 
-    df = datetime.fromisoformat(date_from) if date_from else None
-    dt = datetime.fromisoformat(date_to) if date_to else None
-    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=23, minute=59, second=59)
+    df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
+    dt = None
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        dt = local_to_utc(dt_local)
 
     result = _storage.query_messages(
         chat_id=chat_id, keyword=keyword, sender_id=sender_id,
@@ -362,11 +366,13 @@ def export_messages():
     if keyword and len(keyword) > 200:
         return jsonify({"error": "Keyword too long"}), 400
 
-    df = datetime.fromisoformat(date_from) if date_from else None
-    dt = datetime.fromisoformat(date_to) if date_to else None
-    # Include the full end day: "2026-07-15" -> "2026-07-15 23:59:59"
-    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=23, minute=59, second=59)
+    df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
+    dt = None
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        dt = local_to_utc(dt_local)
 
     result = _storage.query_messages(
         chat_id=chat_id, keyword=keyword, sender_id=sender_id,
@@ -443,10 +449,13 @@ def export_signals():
     signal_only = request.args.get("signal_only", "true").lower() == "true"
     count_only = request.args.get("count_only", "").lower() == "true"
 
-    df = datetime.fromisoformat(date_from) if date_from else None
-    dt = datetime.fromisoformat(date_to) if date_to else None
-    if dt and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=23, minute=59, second=59)
+    df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
+    dt = None
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        dt = local_to_utc(dt_local)
 
     rows = []
     with _storage.engine.connect() as conn:
@@ -1029,9 +1038,19 @@ def signal_factors():
         return jsonify({"error": "Invalid event_type value"}), 400
     if scope and scope not in ("macro", "micro"):
         return jsonify({"error": "Invalid scope value"}), 400
+    # Convert local date strings to UTC for querying against UTC-stored Message.date
+    date_from_utc = None
+    date_to_utc = None
+    if date_from:
+        date_from_utc = local_to_utc(datetime.fromisoformat(date_from))
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        date_to_utc = local_to_utc(dt_local)
     result = _storage.query_signal_factors(
         chat_id=chat_id, sentiment=sentiment, event_type=event_type,
-        scope=scope, date_from=date_from, date_to=date_to,
+        scope=scope, date_from=date_from_utc, date_to=date_to_utc,
         page=page, page_size=page_size,
     )
     return jsonify(result)
@@ -1046,7 +1065,17 @@ def signal_stats():
     chat_id = request.args.get("chat_id", type=int)
     date_from = request.args.get("date_from")
     date_to = request.args.get("date_to")
-    result = _storage.get_signal_stats(chat_id=chat_id, date_from=date_from, date_to=date_to)
+    # Convert local date strings to UTC
+    date_from_utc = None
+    date_to_utc = None
+    if date_from:
+        date_from_utc = local_to_utc(datetime.fromisoformat(date_from)).isoformat()
+    if date_to:
+        dt_local = datetime.fromisoformat(date_to)
+        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0:
+            dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+        date_to_utc = local_to_utc(dt_local).isoformat()
+    result = _storage.get_signal_stats(chat_id=chat_id, date_from=date_from_utc, date_to=date_to_utc)
     return jsonify(result)
 
 

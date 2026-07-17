@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from tgwatcher.client import TGClient
+from tgwatcher.tz_utils import utc_now, local_to_utc
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ class CrawlService:
             current_group_saved=0,
             total_fetched=0,
             total_saved=0,
-            started_at=datetime.now().isoformat(),
+            started_at=utc_now().isoformat(),
             last_crawl_at=None,
             error=None,
             speed=0,
@@ -156,9 +157,10 @@ class CrawlService:
             raw_offset = getattr(self, "_crawl_offset_date", None) or crawl_cfg.get("offset_date")
             raw_until = getattr(self, "_crawl_until_date", None) or crawl_cfg.get("until_date")
             if raw_offset:
-                offset_date = datetime.fromisoformat(raw_offset).replace(tzinfo=timezone.utc)
+                offset_date = local_to_utc(datetime.fromisoformat(raw_offset)).replace(tzinfo=timezone.utc)
             if raw_until:
-                until_date = datetime.fromisoformat(raw_until).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                until_local = datetime.fromisoformat(raw_until).replace(hour=23, minute=59, second=59, microsecond=999999)
+                until_date = local_to_utc(until_local).replace(tzinfo=timezone.utc)
 
         storage = self._storage
 
@@ -180,7 +182,7 @@ class CrawlService:
             while not self._stop_event.is_set():
                 iteration += 1
                 completed = 0
-                crawl_start = datetime.now()
+                crawl_start = utc_now()
                 for group_idx, group in enumerate(groups):
                     if self._stop_event.is_set():
                         break
@@ -256,7 +258,7 @@ class CrawlService:
                         break
 
                     # Calculate speed & ETA after each group
-                    elapsed = (datetime.now() - crawl_start).total_seconds()
+                    elapsed = (utc_now() - crawl_start).total_seconds()
                     total_fetched = self._read_status("total_fetched")
                     speed = round(total_fetched / max(elapsed, 1) * 60, 1) if elapsed > 0 else 0
                     remaining_groups = len(groups) - completed - 1
@@ -271,7 +273,7 @@ class CrawlService:
                     completed += 1
 
                 self._update_status(
-                    last_crawl_at=datetime.now().isoformat(),
+                    last_crawl_at=utc_now().isoformat(),
                     completed_groups=completed,
                 )
 

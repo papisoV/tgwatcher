@@ -460,7 +460,7 @@ let trendChart=null,comparisonChart=null;
 
 async function loadDashboardTab(){
   const s=await api('/api/stats');if(!s)return;
-  const days=s.earliest_message&&s.latest_message?Math.max(1,Math.round((new Date(s.latest_message)-new Date(s.earliest_message))/86400000)):1;
+  const days=s.earliest_message&&s.latest_message?Math.max(1,Math.round((new Date(s.latest_message+'Z')-new Date(s.earliest_message+'Z'))/86400000)):1;
   const avg=s.total_messages?Math.round(s.total_messages/days):0;
   document.getElementById('kpiTotal').textContent=(s.total_messages||0).toLocaleString();
   document.getElementById('kpiChats').textContent=s.monitored_chats||'0';
@@ -560,8 +560,8 @@ function showDateRangePanel(){
   const panel=document.getElementById('crawlDatePanel');
   panel.style.display='flex';
   const to=new Date();const from=new Date();from.setDate(from.getDate()-7);
-  document.getElementById('crawlDateTo').value=to.toISOString().slice(0,10);
-  document.getElementById('crawlDateFrom').value=from.toISOString().slice(0,10);
+  document.getElementById('crawlDateTo').value=_localDateStr(to);
+  document.getElementById('crawlDateFrom').value=_localDateStr(from);
 }
 
 function hideDateRangePanel(){

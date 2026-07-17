@@ -16,6 +16,8 @@ proxy:
   protocol: socks5
 storage:
   db_path: ./data/tgwatcher.db
+timezone:
+  utc_offset_hours: 8
 telegram:
   api_hash: YOUR_API_HASH_HERE
   api_id: YOUR_API_ID_HERE

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, text as sa_text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -22,7 +22,7 @@ class Chat(Base):
     chat_username: Mapped[str | None] = mapped_column(String(128))
     chat_type: Mapped[str | None] = mapped_column(String(20))
     members: Mapped[int | None] = mapped_column(Integer)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=sa_text("(datetime('now'))"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
 
 
 class Sender(Base):
@@ -31,7 +31,7 @@ class Sender(Base):
     sender_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     sender_name: Mapped[str | None] = mapped_column(String(256))
     sender_username: Mapped[str | None] = mapped_column(String(128))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=sa_text("(datetime('now'))"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
 
 
 class Message(Base):
@@ -58,7 +58,7 @@ class Message(Base):
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     media_type: Mapped[str | None] = mapped_column(String(32))
     media_id: Mapped[str | None] = mapped_column(String(256))
-    crawled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=sa_text("(datetime('now'))"))
+    crawled_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
 
 
 class SignalFactor(Base):
@@ -89,8 +89,8 @@ class SignalFactor(Base):
     matched_keywords: Mapped[str | None] = mapped_column(Text)              # JSON array
     keyword_preliminary: Mapped[str | None] = mapped_column(Text)           # JSON dict
     # Timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=sa_text("(datetime('now'))"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=sa_text("(datetime('now'))"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
 
 
 # Composite index for chat+date queries

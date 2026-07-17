@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, text
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tgwatcher.models import Base, Chat, Message, Sender, SignalFactor
 from tgwatcher.schemas import EditUpdate, ParsedChat, ParsedMessage, ParsedSender
+from tgwatcher.tz_utils import utc_now, local_to_utc, sql_tz_shift, tz_offset_hours
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +127,15 @@ class Storage:
     @staticmethod
     def _ensure_datetime(value):
         if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                return value.astimezone(timezone.utc).replace(tzinfo=None)
             return value
         if isinstance(value, str):
             try:
-                return datetime.fromisoformat(value)
+                dt = datetime.fromisoformat(value)
+                if dt.tzinfo is not None:
+                    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
             except ValueError:
                 return None
         return None
@@ -148,7 +154,7 @@ class Storage:
                     row.chat_type = chat.chat_type
                 if chat.members is not None:
                     row.members = chat.members
-                row.updated_at = datetime.now()
+                row.updated_at = utc_now()
             else:
                 row = Chat(
                     chat_id=chat.chat_id,
@@ -168,7 +174,7 @@ class Storage:
                     row.sender_name = sender.sender_name
                 if sender.sender_username is not None:
                     row.sender_username = sender.sender_username
-                row.updated_at = datetime.now()
+                row.updated_at = utc_now()
             else:
                 row = Sender(
                     sender_id=sender.sender_id,
@@ -231,7 +237,7 @@ class Storage:
                                 if record and msg.text and record.text != msg.text:
                                     record.text = msg.text
                                     record.is_edited = True
-                                    record.edited_at = self._ensure_datetime(msg.edit_date) or datetime.now()
+                                    record.edited_at = self._ensure_datetime(msg.edit_date) or utc_now()
                                 if record and msg.media_type and not record.media_type:
                                     record.media_type = msg.media_type
                                     record.media_id = msg.media_id
@@ -254,7 +260,7 @@ class Storage:
                             is_deleted=False,
                             media_type=msg.media_type,
                             media_id=msg.media_id,
-                            crawled_at=datetime.now(),
+                            crawled_at=utc_now(),
                         )
                         session.add(record)
                         saved += 1
@@ -430,17 +436,20 @@ class Storage:
 
     def get_message_trend(self, period: str = "day", days: int = 30, chat_id: int | None = None) -> dict:
         with self.get_session() as session:
+            tz_shift = sql_tz_shift()
             q = session.query(
                 Message.chat_id,
                 Message.chat_title,
-                func.date(Message.date).label("msg_date"),
+                func.date(Message.date, tz_shift).label("msg_date"),
                 func.count(Message.id).label("count"),
             ).filter(Message.is_deleted == False)
             if chat_id is not None:
                 q = q.filter(Message.chat_id == chat_id)
-            q = q.filter(Message.date >= func.date("now", f"-{days} days"))
-            q = q.group_by(Message.chat_id, Message.chat_title, func.date(Message.date))
-            q = q.order_by(func.date(Message.date))
+            # Expand the UTC window to cover the local-day range
+            extra_days = 1 if tz_offset_hours() > 0 else 0
+            q = q.filter(Message.date >= func.datetime("now", f"-{days + extra_days} days"))
+            q = q.group_by(Message.chat_id, Message.chat_title, func.date(Message.date, tz_shift))
+            q = q.order_by(func.date(Message.date, tz_shift))
             rows = q.all()
 
         datasets: dict[tuple, dict] = {}
@@ -468,16 +477,16 @@ class Storage:
         return result
 
     def get_activity_heatmap(self, chat_id: int | None = None) -> dict:
-        from sqlalchemy import extract
         with self.get_session() as session:
+            tz_shift = sql_tz_shift()
             q = session.query(
-                extract("hour", Message.date).label("hour"),
-                extract("dow", Message.date).label("dow"),
+                func.strftime("%H", Message.date, tz_shift).label("hour"),
+                func.strftime("%w", Message.date, tz_shift).label("dow"),
                 func.count(Message.id).label("count"),
             ).filter(Message.is_deleted == False)
             if chat_id is not None:
                 q = q.filter(Message.chat_id == chat_id)
-            q = q.group_by(extract("hour", Message.date), extract("dow", Message.date))
+            q = q.group_by(func.strftime("%H", Message.date, tz_shift), func.strftime("%w", Message.date, tz_shift))
             rows = q.all()
 
         data = []
@@ -581,7 +590,7 @@ class Storage:
 
     def query_signal_factors(self, chat_id: int | None = None, sentiment: str | None = None,
                              event_type: str | None = None, scope: str | None = None,
-                             date_from: str | None = None, date_to: str | None = None,
+                             date_from: datetime | None = None, date_to: datetime | None = None,
                              page: int = 1, page_size: int = 50) -> dict:
         with self.get_session() as session:
             q = session.query(SignalFactor, Message).join(
@@ -610,7 +619,7 @@ class Storage:
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     def get_signal_stats(self, chat_id: int | None = None,
-                         date_from: str | None = None, date_to: str | None = None) -> dict:
+                         date_from: datetime | None = None, date_to: datetime | None = None) -> dict:
         with self.get_session() as session:
             q = session.query(SignalFactor)
             if chat_id:
@@ -646,7 +655,7 @@ class Storage:
         }
 
     def get_unprocessed_messages(self, chat_id: int | None = None,
-                                  date_from: str | None = None, date_to: str | None = None,
+                                  date_from: datetime | None = None, date_to: datetime | None = None,
                                   overwrite: bool = False) -> list[dict]:
         with self.get_session() as session:
             if overwrite:
@@ -677,19 +686,21 @@ class Storage:
     def get_signal_trend(self, period: str = "day", days: int = 30,
                          chat_id: int | None = None) -> dict:
         with self.get_session() as session:
+            tz_shift = sql_tz_shift()
+            extra_days = 1 if tz_offset_hours() > 0 else 0
             q = session.query(
-                func.date(Message.date).label("date"),
+                func.date(Message.date, tz_shift).label("date"),
                 SignalFactor.sentiment_label,
                 func.count().label("count"),
             ).join(
                 SignalFactor, (Message.message_id == SignalFactor.message_id) & (Message.chat_id == SignalFactor.chat_id)
             ).filter(
                 SignalFactor.llm_status == "completed",
-                Message.date >= func.datetime("now", f"-{days} days"),
+                Message.date >= func.datetime("now", f"-{days + extra_days} days"),
             )
             if chat_id:
                 q = q.filter(Message.chat_id == chat_id)
-            rows = q.group_by(func.date(Message.date), SignalFactor.sentiment_label).order_by(func.date(Message.date)).all()
+            rows = q.group_by(func.date(Message.date, tz_shift), SignalFactor.sentiment_label).order_by(func.date(Message.date, tz_shift)).all()
         trend = {}
         for r in rows:
             date_str = str(r.date)
@@ -706,11 +717,11 @@ class Storage:
         return count
 
     def reset_stuck_processing(self, timeout_minutes: int = 10) -> int:
-        cutoff = datetime.now().timestamp() - timeout_minutes * 60
+        cutoff = utc_now() - timedelta(minutes=timeout_minutes)
         with self.get_session() as session:
             count = session.query(SignalFactor).filter(
                 SignalFactor.llm_status == "processing",
-                SignalFactor.updated_at < datetime.fromtimestamp(cutoff),
+                SignalFactor.updated_at < cutoff,
             ).update({"llm_status": "pending"})
             session.commit()
         return count

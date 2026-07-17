@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -98,10 +98,12 @@ async def cmd_crawl(config: dict) -> None:
 
     offset_date = None
     until_date = None
+    from tgwatcher.tz_utils import local_to_utc
     if crawl_cfg.get("offset_date"):
-        offset_date = datetime.fromisoformat(crawl_cfg["offset_date"])
+        offset_date = local_to_utc(datetime.fromisoformat(crawl_cfg["offset_date"])).replace(tzinfo=timezone.utc)
     if crawl_cfg.get("until_date"):
-        until_date = datetime.fromisoformat(crawl_cfg["until_date"])
+        until_local = datetime.fromisoformat(crawl_cfg["until_date"]).replace(hour=23, minute=59, second=59, microsecond=999999)
+        until_date = local_to_utc(until_local).replace(tzinfo=timezone.utc)
 
     db_path = config["storage"]["db_path"]
     storage = Storage(db_path)
@@ -216,6 +218,9 @@ def main():
 
     config_path = _resolve_config_path(args.config)
     config = load_config(config_path)
+
+    from tgwatcher.tz_utils import set_tz_offset
+    set_tz_offset(config.get("timezone", {}).get("utc_offset_hours", 8))
 
     if args.login:
         asyncio.run(cmd_login(config))

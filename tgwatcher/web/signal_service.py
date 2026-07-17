@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable
 
 from tgwatcher.signal_engine import SignalEngine
+from tgwatcher.tz_utils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class SignalService:
             failed=0,
             skipped=0,
             errors=[],
-            started_at=datetime.now().isoformat(),
+            started_at=utc_now().isoformat(),
             finished_at=None,
         )
         thread = threading.Thread(target=self._run_loop, args=(chat_id, overwrite), daemon=True)
@@ -91,11 +92,11 @@ class SignalService:
                 failed=result.failed,
                 skipped=result.skipped,
                 errors=result.errors[:10],
-                finished_at=datetime.now().isoformat(),
+                finished_at=utc_now().isoformat(),
             )
         except Exception as e:
             logger.error("Signal service error: %s", e)
-            self._update_status(errors=[str(e)], finished_at=datetime.now().isoformat())
+            self._update_status(errors=[str(e)], finished_at=utc_now().isoformat())
         finally:
             self._stop_event.set()
             self._update_status(running=False)
