@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, text as sa_text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint, text as sa_text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -70,20 +70,21 @@ class SignalFactor(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # Factor dimensions (Integer 1-5 for SQLite friendliness)
-    sentiment: Mapped[int | None] = mapped_column(Integer)           # 1=强烈利空..5=强烈利好
-    sentiment_label: Mapped[str | None] = mapped_column(String(20))  # bearish/neutral/bullish
-    event_type: Mapped[str | None] = mapped_column(String(32))       # regulatory/macro/exploit/...
-    scope: Mapped[str | None] = mapped_column(String(16))            # macro/micro
-    intensity: Mapped[int | None] = mapped_column(Integer)           # 1-5
-    urgency: Mapped[int | None] = mapped_column(Integer)             # 1-5
-    reasoning: Mapped[str | None] = mapped_column(Text)              # LLM判断依据
+    # Factor dimensions (float for quantitative weighting)
+    direction: Mapped[float | None] = mapped_column(Float)          # [-1.0, 1.0] negative=bearish, positive=bullish
+    magnitude: Mapped[float | None] = mapped_column(Float)          # [0.0, 1.0] impact strength
+    urgency: Mapped[float | None] = mapped_column(Float)            # [0.0, 1.0] time-sensitivity
+    confidence: Mapped[float | None] = mapped_column(Float)         # [0.0, 1.0] LLM judgment confidence
+    halflife_min: Mapped[int | None] = mapped_column(Integer)       # >= 1, decay half-life in minutes
+    symbols: Mapped[str | None] = mapped_column(Text)               # JSON array: '["BTC","ETH"]' or '["*"]'
+    event_type: Mapped[str | None] = mapped_column(String(32))      # security|regulatory|macro|whale|market|listing|partnership|other
+    reasoning: Mapped[str | None] = mapped_column(Text)             # LLM reasoning, <= 200 chars
     # Processing metadata
     llm_status: Mapped[str] = mapped_column(String(20), default="pending")  # pending/processing/completed/failed/skipped
     llm_error: Mapped[str | None] = mapped_column(String(256))
     llm_model: Mapped[str | None] = mapped_column(String(64))
     llm_raw: Mapped[str | None] = mapped_column(Text)                       # raw LLM response for debugging
-    factor_version: Mapped[int] = mapped_column(Integer, default=1)         # bumped when prompt changes
+    factor_version: Mapped[int] = mapped_column(Integer, default=2)         # v2 = new schema
     # Keyword filter metadata
     filter_result: Mapped[str | None] = mapped_column(String(16))           # passed/rejected
     matched_keywords: Mapped[str | None] = mapped_column(Text)              # JSON array
@@ -101,4 +102,3 @@ Index("ix_signal_factors_message_id", SignalFactor.message_id)
 Index("ix_signal_factors_chat_id", SignalFactor.chat_id)
 Index("ix_signal_factors_llm_status", SignalFactor.llm_status)
 Index("ix_signal_factors_event_type", SignalFactor.event_type)
-Index("ix_signal_factors_sentiment_label", SignalFactor.sentiment_label)

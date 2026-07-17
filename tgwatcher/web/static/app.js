@@ -380,15 +380,10 @@ async function updateSignalExportPreview(){
     const df=document.getElementById('signalExportDateFrom').value;
     const dt=document.getElementById('signalExportDateTo').value;
     if(!df&&!dt){el.textContent='请选择日期范围';return}
-    const source=document.querySelector('input[name="signalExportSource"]:checked')?.value||'claude';
-    const signalOnly=document.getElementById('signalExportSignalOnly').checked;
     const fmt=document.querySelector('input[name="signalExportFormat"]:checked')?.value||'json';
-    const sourceLabel={claude:'Claude',deepseek:'DeepSeek',both:'对比'}[source];
-    // Use export endpoint with format=json to get count (limit 1 for speed)
+    // Use export endpoint with count_only to get count
     const params=new URLSearchParams();
     params.set('format','json');
-    params.set('source',source);
-    params.set('signal_only',signalOnly?'true':'false');
     params.set('count_only','true');
     const chatId=document.getElementById('signalExportGroupSelect').value;
     if(chatId)params.set('chat_id',chatId);
@@ -397,7 +392,7 @@ async function updateSignalExportPreview(){
     try{
       const data=await api('/api/signals/export?'+params);
       if(data && data.count!==undefined){
-        el.textContent=`将导出 ${data.count} 条${signalOnly?'信号':'分析结果'} (${sourceLabel}, ${fmt.toUpperCase()})`;
+        el.textContent=`将导出 ${data.count} 条分析结果 (${fmt.toUpperCase()})`;
       }else if(data && data.error){
         el.textContent=data.error;
       }else{
@@ -422,12 +417,8 @@ function _buildSignalExportParams(){
 
 async function doSignalExport(){
   const fmt=document.querySelector('input[name="signalExportFormat"]:checked')?.value||'json';
-  const source=document.querySelector('input[name="signalExportSource"]:checked')?.value||'claude';
-  const signalOnly=document.getElementById('signalExportSignalOnly').checked;
   const params=_buildSignalExportParams();
   params.set('format',fmt);
-  params.set('source',source);
-  params.set('signal_only',signalOnly?'true':'false');
   const df=document.getElementById('signalExportDateFrom').value;
   const dt=document.getElementById('signalExportDateTo').value;
   if(!df&&!dt){
@@ -768,15 +759,13 @@ let signalTrendChart=null,signalEventChart=null;
 async function loadSignalTab(){
   const s=await api('/api/signal/stats');if(!s)return;
   const total=s.total||0;
-  const completed=s.completed||0;
-  const bullish=(s.sentiment||{}).bullish||0;
-  const bearish=(s.sentiment||{}).bearish||0;
-  const bullishPct=completed?Math.round(bullish/completed*100):0;
-  const bearishPct=completed?Math.round(bearish/completed*100):0;
+  const dir=s.direction||{};
+  const bullishPct=total?Math.round((dir.bullish||0)/total*100):0;
+  const bearishPct=total?Math.round((dir.bearish||0)/total*100):0;
   document.getElementById('signalKpiTotal').textContent=total.toLocaleString();
   document.getElementById('signalKpiBullish').textContent=bullishPct+'%';
   document.getElementById('signalKpiBearish').textContent=bearishPct+'%';
-  document.getElementById('signalKpiUrgency').textContent=s.avg_urgency?Number(s.avg_urgency).toFixed(1):'-';
+  document.getElementById('signalKpiUrgency').textContent=s.avg_magnitude?Number(s.avg_magnitude).toFixed(2):'-';
   loadSignalTrendChart();
   loadSignalEventChart(s.event_types||{});
   loadSignalTable();
@@ -786,16 +775,16 @@ async function loadSignalTab(){
 async function loadSignalTrendChart(){
   const d=await api('/api/signal/trend?days=30');if(!d||!d.trend)return;
   const labels=Object.keys(d.trend).sort();
-  const bullish=labels.map(l=>(d.trend[l].bullish||0));
-  const bearish=labels.map(l=>(d.trend[l].bearish||0));
-  const neutral=labels.map(l=>(d.trend[l].neutral||0));
+  const avgDirection=labels.map(l=>(d.trend[l].avg_direction||0));
+  const avgMagnitude=labels.map(l=>(d.trend[l].avg_magnitude||0));
+  const counts=labels.map(l=>(d.trend[l].count||0));
   if(signalTrendChart)signalTrendChart.destroy();
   const el=document.getElementById('signalTrendChart');if(!el)return;
   signalTrendChart=new Chart(el,{type:'line',data:{labels,datasets:[
-    {label:'看涨',data:bullish,borderColor:'#00ff88',backgroundColor:'#00ff8818',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5},
-    {label:'中性',data:neutral,borderColor:'#00e5ff',backgroundColor:'#00e5ff18',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5},
-    {label:'看跌',data:bearish,borderColor:'#ff3d71',backgroundColor:'#ff3d7118',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5},
-  ]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{color:'#6b7a8d',font:{size:10}},grid:{color:'#1a1f2e'}},y:{ticks:{color:'#6b7a8d',font:{size:10}},grid:{color:'#1a1f2e'}}},plugins:{legend:{labels:{color:'#a0aec0',font:{size:11}}}}}});
+    {label:'方向均值',data:avgDirection,borderColor:'#00e5ff',backgroundColor:'#00e5ff18',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5,yAxisID:'y'},
+    {label:'幅度均值',data:avgMagnitude,borderColor:'#00ff88',backgroundColor:'#00ff8818',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5,yAxisID:'y'},
+    {label:'消息数',data:counts,borderColor:'#ffb300',backgroundColor:'#ffb30018',fill:false,tension:0.3,pointRadius:0,borderWidth:1,borderDash:[3,3],yAxisID:'y1'},
+  ]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{color:'#6b7a8d',font:{size:10}},grid:{color:'#1a1f2e'}},y:{ticks:{color:'#6b7a8d',font:{size:10}},grid:{color:'#1a1f2e'},min:-1,max:1},y1:{position:'right',ticks:{color:'#6b7a8d',font:{size:10}},grid:{display:false},min:0}},plugins:{legend:{labels:{color:'#a0aec0',font:{size:11}}}}}});
 }
 
 function loadSignalEventChart(eventTypes){
@@ -811,12 +800,13 @@ async function loadSignalTable(){
   const d=await api('/api/signal/factors?page_size=50');if(!d||!d.items)return;
   const tbody=document.getElementById('signalTableBody');
   tbody.innerHTML=d.items.map(f=>{
-    const sentColor=f.sentiment_label==='bullish'?'#00ff88':f.sentiment_label==='bearish'?'#ff3d71':'#6b7a8d';
-    const sentText=f.sentiment_label==='bullish'?'看涨':f.sentiment_label==='bearish'?'看跌':'中性';
-    const scopeText=f.scope==='macro'?'宏观':'微观';
-    const text=(f.text||'').slice(0,60);
+    const dir=f.direction||0;
+    const dirColor=dir>0.1?'#00ff88':dir<-0.1?'#ff3d71':'#6b7a8d';
+    const dirLabel=dir>0.1?'利多':dir<-0.1?'利空':'中性';
+    const symbols=JSON.parse(f.symbols||'[]').join(',');
+    const text=(f.text||'').slice(0,50);
     const date=fmtTime(f.date);
-    return `<tr><td style="white-space:nowrap">${date}</td><td style="color:${sentColor}">${sentText}</td><td>${f.event_type||'-'}</td><td>${scopeText}</td><td>${f.intensity||'-'}</td><td>${f.urgency||'-'}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text}</td></tr>`;
+    return `<tr><td style="white-space:nowrap">${date}</td><td style="color:${dirColor}">${dirLabel} ${dir.toFixed(2)}</td><td>${f.event_type||'-'}</td><td>${(f.magnitude||0).toFixed(2)}</td><td>${(f.urgency||0).toFixed(2)}</td><td>${(f.confidence||0).toFixed(2)}</td><td>${f.halflife_min||'-'}</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text}</td></tr>`;
   }).join('');
 }
 

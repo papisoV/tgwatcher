@@ -19,15 +19,12 @@ Usage:
 """
 
 # ── Noise pre-filter rules ──────────────────────────────────────────
-# High-confidence noise patterns — only exclude messages that are VERY likely noise.
-# Borderline cases are left for Claude to judge.
 NOISE_PATTERNS: dict[str, list[str]] = {
     "price_quote": [
         "突破$", "跌破$", "站上$", "逼近$", "触及$",
         "创历史新高", "创年内新低", "创历史新低",
         "涨幅%", "跌幅%", "涨%", "跌%",
         "24h涨", "24h跌", "24H涨", "24H跌",
-        # Chinese price patterns
         "突破.*美元", "跌破.*美元", "站上.*美元",
         "价格突破", "价格跌破",
         "比特币价格", "BTC价格",
@@ -49,7 +46,6 @@ NOISE_PATTERNS: dict[str, list[str]] = {
         "恐惧贪婪指数", "多空比", "资金费率",
         "持仓量变化", "清算数据", "爆仓",
         "未平仓合约", "OI变化",
-        # Chinese routine data patterns
         "空头头寸被清算", "多头头寸被清算",
         "标普.*指数.*上涨", "标普.*指数.*下跌",
         "纳斯达克指数.*上涨", "纳斯达克指数.*下跌",
@@ -57,7 +53,6 @@ NOISE_PATTERNS: dict[str, list[str]] = {
         "原油库存", "制造业指数",
     ],
     "stock_news": [
-        # Non-crypto stock news that shouldn't be crypto signals
         "股价.*跌破", "股价.*突破",
         "IPO发行价", "可转换优先",
         "CONV SR", "票据到期",
@@ -65,7 +60,6 @@ NOISE_PATTERNS: dict[str, list[str]] = {
 }
 
 # Macro-signal keywords — if a message matches ANY of these, it's NEVER filtered as noise
-# even if it also matches a noise pattern (e.g., "BTC创历史新高，美联储降息推动" should be kept)
 MACRO_SIGNAL_KEYWORDS: list[str] = [
     "美联储", "Fed", "降息", "加息", "利率", "CPI", "GDP", "非农", "NFP",
     "通胀", "通缩", "量化宽松", "QE", "QT", "缩表",
@@ -78,23 +72,27 @@ MACRO_SIGNAL_KEYWORDS: list[str] = [
     "欧央行", "BOJ", "日本央行", "英国央行",
 ]
 
+# Default halflife by event_type (minutes)
+DEFAULT_HALFLIFE = {
+    "security": 180,
+    "regulatory": 1440,
+    "macro": 720,
+    "whale": 120,
+    "market": 60,
+    "listing": 240,
+    "partnership": 360,
+    "other": 60,
+}
+
 
 # ── Text deduplication ──────────────────────────────────────────────
 def _dedup_tradfin_translation(text: str) -> str:
-    """
-    Remove duplicate Chinese translation block from Tradfin messages.
-
-    Pattern: **Tradfin：...content...**\\nTradfin：...same content in Chinese...
-    The second block is a machine translation of the first and adds no value.
-    Also strips separator lines (————————————).
-    """
+    """Remove duplicate Chinese translation block from Tradfin messages."""
     if not text or "Tradfin" not in text:
         return text
 
-    # Strip separator lines
     text = re.sub(r'—{5,}', '', text)
 
-    # Pattern: bold section ends with **, newline, then Tradfin： starts translation
     parts = re.split(r'\*\*\s*\n(?=Tradfin[：:])', text, maxsplit=1)
     if len(parts) == 2:
         result = parts[0].strip()
@@ -102,7 +100,6 @@ def _dedup_tradfin_translation(text: str) -> str:
         result = re.sub(r'\*\*$', '', result).strip()
         return result
 
-    # Fallback: remove everything from second Tradfin： line onward
     lines = text.split('\n')
     seen_tradfin = False
     kept_lines = []
@@ -121,39 +118,49 @@ TOKEN_PATTERN = re.compile(
     r'|(?<!\w)(BTC|ETH|SOL|BNB|XRP|ADA|DOGE|AVAX|DOT|MATIC|LINK|UNI|AAVE|ARB|OP|APT|SUI|SEI|NEAR|FTM|ATOM|FIL|INJ|TIA|JUP|WIF|PEPE|SHIB|TRUMP|DJT)(?!\w)'
 )
 
-# ── Category-to-factor mapping ──────────────────────────────────────
+# ── Category-to-factor mapping (new schema) ──────────────────────────
 CATEGORY_FACTOR_MAP: dict[str, dict] = {
     "event_regulatory": {
-        "event_type": "regulatory", "scope": "macro",
-        "sentiment": 2, "intensity": 4, "urgency": 4, "action_hint": "hedge",
+        "event_type": "regulatory",
+        "direction": -0.5, "magnitude": 0.7, "urgency": 0.7,
+        "confidence": 0.7, "halflife_min": 1440,
     },
     "event_macro": {
-        "event_type": "macro", "scope": "macro",
-        "sentiment": 3, "intensity": 4, "urgency": 3, "action_hint": "watch",
+        "event_type": "macro",
+        "direction": 0.0, "magnitude": 0.7, "urgency": 0.5,
+        "confidence": 0.7, "halflife_min": 720,
     },
     "event_exploit": {
-        "event_type": "exploit", "scope": "micro",
-        "sentiment": 1, "intensity": 5, "urgency": 5, "action_hint": "short",
+        "event_type": "security",
+        "direction": -0.8, "magnitude": 0.8, "urgency": 0.9,
+        "confidence": 0.8, "halflife_min": 180,
+    },
+    "event_whale": {
+        "event_type": "whale",
+        "direction": -0.3, "magnitude": 0.6, "urgency": 0.6,
+        "confidence": 0.6, "halflife_min": 120,
     },
     "event_listing": {
-        "event_type": "listing", "scope": "micro",
-        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "watch",
+        "event_type": "listing",
+        "direction": 0.5, "magnitude": 0.5, "urgency": 0.4,
+        "confidence": 0.7, "halflife_min": 240,
     },
     "event_partnership": {
-        "event_type": "partnership", "scope": "micro",
-        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "watch",
+        "event_type": "partnership",
+        "direction": 0.4, "magnitude": 0.4, "urgency": 0.3,
+        "confidence": 0.6, "halflife_min": 360,
     },
     "bullish": {
-        "event_type": "market", "scope": "micro",
-        "sentiment": 4, "intensity": 3, "urgency": 2, "action_hint": "long",
+        "event_type": "market",
+        "direction": 0.5, "magnitude": 0.4, "urgency": 0.3,
+        "confidence": 0.5, "halflife_min": 60,
     },
     "bearish": {
-        "event_type": "market", "scope": "micro",
-        "sentiment": 2, "intensity": 3, "urgency": 2, "action_hint": "short",
+        "event_type": "market",
+        "direction": -0.5, "magnitude": 0.4, "urgency": 0.3,
+        "confidence": 0.5, "halflife_min": 60,
     },
-    "scope_macro": {"scope": "macro"},
-    "scope_micro": {"scope": "micro"},
-    "urgency_high": {"urgency": 5, "intensity": 4},
+    "urgency_high": {"urgency": 0.9, "magnitude": 0.7},
 }
 
 
@@ -167,43 +174,20 @@ def _extract_tokens(text: str) -> list[str]:
     return sorted(tokens)
 
 
-def _compute_sentiment_label(sentiment: int) -> str:
-    """Compute sentiment label from numeric value."""
-    if sentiment <= 2:
-        return "bearish"
-    if sentiment == 3:
-        return "neutral"
-    return "bullish"
-
-
 def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
-    """
-    Pre-analyze a single message using local rules.
-
-    Returns a factor dict with is_signal, pre-filled factor values,
-    and a confidence field ("high" = no Claude review needed, "low" = review).
-    """
+    """Pre-analyze a single message using local rules (new schema)."""
     from tgwatcher.signal_filter import KeywordFilter, DEFAULT_KEYWORD_RULES
 
     clean_text = _dedup_tradfin_translation(text)
 
-    # Step 1: Check if high-confidence noise (price quotes, routine data, etc.)
     is_noise, noise_reason = _is_likely_noise(clean_text)
 
-    # Step 2: Run keyword filter
     kf = KeywordFilter({"keywords": DEFAULT_KEYWORD_RULES})
     filter_result = kf.filter(clean_text)
 
-    # Determine if keyword filter found a "strong" signal category
     categories = filter_result.preliminary_factors.get("matched_categories", [])
     has_strong_signal = any(c in ("event_regulatory", "event_macro", "event_exploit") for c in categories)
 
-    # Noise classification logic:
-    # - No keyword match at all → noise
-    # - Noise pattern matched AND no strong signal category → noise
-    #   (e.g., "标普500上涨0.4%" matches bullish/上涨 but is just market data)
-    # - Noise pattern matched BUT strong signal present → borderline, keep as signal candidate
-    # - No noise pattern, keyword match → signal candidate
     is_definite_noise = (not filter_result.passed) or (is_noise and not has_strong_signal)
 
     if is_definite_noise:
@@ -211,48 +195,37 @@ def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
             "message_id": msg_id,
             "chat_id": chat_id,
             "is_signal": False,
-            "sentiment": 3,
-            "sentiment_label": "neutral",
+            "direction": 0.0,
+            "magnitude": 0.1,
+            "urgency": 0.1,
+            "confidence": 0.9,
+            "halflife_min": 30,
+            "symbols": "[]",
             "event_type": "market",
-            "scope": "micro",
-            "intensity": 1,
-            "urgency": 1,
-            "action_hint": "none",
-            "affected_tokens": [],
-            "reasoning": f"noise: {noise_reason}, no strong signal category" if is_noise else "noise: no signal keywords matched",
-            "confidence": "high",
+            "reasoning": f"noise: {noise_reason}" if is_noise else "noise: no signal keywords matched",
             "matched_categories": [],
             "matched_keywords": filter_result.matched_keywords,
         }
 
-    # Even if keyword filter passed, check if it's noise with macro override
-    # e.g., "特朗普硬币视频" matches "特朗普" but is just a meme, not a signal
-    # If the ONLY match is from MACRO_SIGNAL_KEYWORDS and noise pattern also matched,
-    # classify as low-confidence signal (Claude will review)
-    categories = filter_result.preliminary_factors.get("matched_categories", [])
-
-    # Signal candidate — build pre-filled factors from categories
+    # Signal candidate — build pre-filled factors
     factors: dict = {
         "message_id": msg_id,
         "chat_id": chat_id,
         "is_signal": True,
-        "sentiment": 3,
-        "sentiment_label": "neutral",
+        "direction": 0.0,
+        "magnitude": 0.5,
+        "urgency": 0.5,
+        "confidence": 0.3,
+        "halflife_min": 60,
+        "symbols": json.dumps(_extract_tokens(clean_text), ensure_ascii=False),
         "event_type": "other",
-        "scope": "micro",
-        "intensity": 3,
-        "urgency": 3,
-        "action_hint": "watch",
-        "affected_tokens": _extract_tokens(clean_text),
         "reasoning": "",
-        "confidence": "low",
         "matched_categories": categories,
         "matched_keywords": filter_result.matched_keywords,
     }
 
-    # If noise pattern also matched, mark as low-confidence (Claude should double-check)
     if is_noise:
-        factors["confidence"] = "low"
+        factors["confidence"] = 0.2
         factors["reasoning"] = f"borderline: noise pattern ({noise_reason}) but signal keywords present"
 
     # Merge category-specific overrides
@@ -268,24 +241,14 @@ def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
         if primary in CATEGORY_FACTOR_MAP:
             factors["event_type"] = CATEGORY_FACTOR_MAP[primary]["event_type"]
 
-    # Override scope if scope_* categories present
-    scope_cats = [c for c in categories if c.startswith("scope_")]
-    if scope_cats:
-        last_scope = scope_cats[-1]
-        if last_scope in CATEGORY_FACTOR_MAP and "scope" in CATEGORY_FACTOR_MAP[last_scope]:
-            factors["scope"] = CATEGORY_FACTOR_MAP[last_scope]["scope"]
-
     # Override urgency if urgency_high present
     if "urgency_high" in categories:
-        factors["urgency"] = 5
-        factors["intensity"] = max(factors.get("intensity", 3), 4)
+        factors["urgency"] = 0.9
+        factors["magnitude"] = max(factors.get("magnitude", 0.5), 0.7)
 
-    # Compute sentiment_label from final sentiment
-    factors["sentiment_label"] = _compute_sentiment_label(factors["sentiment"])
-
-    # Macro events with no specific tokens → empty affected_tokens
-    if factors["scope"] == "macro" and factors["event_type"] in ("macro", "regulatory"):
-        factors["affected_tokens"] = []
+    # Default halflife from event_type
+    if factors.get("halflife_min", 60) == 60:
+        factors["halflife_min"] = DEFAULT_HALFLIFE.get(factors.get("event_type", "other"), 60)
 
     # Auto-reasoning from matched categories
     if not factors["reasoning"]:
@@ -293,6 +256,7 @@ def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
             "event_regulatory": "监管事件",
             "event_macro": "宏观经济",
             "event_exploit": "安全事件",
+            "event_whale": "鲸鱼/机构",
             "event_listing": "上线事件",
             "event_partnership": "合作事件",
             "bullish": "利好信号",
@@ -306,31 +270,22 @@ def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
 
 
 def _is_likely_noise(text: str) -> tuple[bool, str]:
-    """
-    Check if a message is high-confidence noise.
-
-    Returns (is_noise, reason). Only returns True when very confident.
-    Messages matching macro-signal keywords are NEVER classified as noise.
-    """
+    """Check if a message is high-confidence noise."""
     if not text:
         return False, ""
 
-    # If any macro-signal keyword is present, keep it — never filter
     text_lower = text.lower()
     for kw in MACRO_SIGNAL_KEYWORDS:
         if kw.lower() in text_lower:
             return False, ""
 
-    # Check noise patterns
     for category, patterns in NOISE_PATTERNS.items():
         for pattern in patterns:
             if "$" in pattern:
-                # Dollar-sign patterns: $ means "digit" (e.g., "突破$60000")
                 regex_pattern = pattern.replace("$", r"\d")
                 if re.search(regex_pattern, text):
                     return True, f"noise:{category}"
             elif ".*" in pattern or "%" in pattern:
-                # Regex patterns (e.g., "突破.*美元", "涨幅%")
                 try:
                     if re.search(pattern, text):
                         return True, f"noise:{category}"
@@ -358,7 +313,6 @@ def cmd_preanalyze(db_path: str, args: list[str]):
     from sqlalchemy import text
     storage = _get_storage(db_path)
 
-    # Parse args
     count = 100
     chat_id = None
     date_from = None
@@ -383,7 +337,6 @@ def cmd_preanalyze(db_path: str, args: list[str]):
         else:
             i += 1
 
-    # Fetch messages
     from datetime import datetime
     from tgwatcher.tz_utils import local_to_utc, utc_to_local
     df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
@@ -415,7 +368,7 @@ def cmd_preanalyze(db_path: str, args: list[str]):
                     params[f"mid{j}"] = mid
                     params[f"cid{j}"] = cid
                 rows = conn.execute(text(
-                    f"SELECT message_id, chat_id FROM claude_factors "
+                    f"SELECT message_id, chat_id FROM signal_factors "
                     f"WHERE (message_id, chat_id) IN ({placeholders}) "
                     f"AND llm_status='completed'"
                 ), params).fetchall()
@@ -425,7 +378,6 @@ def cmd_preanalyze(db_path: str, args: list[str]):
 
     messages = messages[:count]
 
-    # Run pre-analysis on each message
     noise_results: list[dict] = []
     signal_candidates: list[dict] = []
 
@@ -433,7 +385,6 @@ def cmd_preanalyze(db_path: str, args: list[str]):
         text = m.get("text") or ""
         pre = _preanalyze_message(text, m["message_id"], m["chat_id"])
 
-        # Add metadata for display (convert UTC to local time)
         date_val = m.get("date")
         if date_val:
             try:
@@ -454,13 +405,14 @@ def cmd_preanalyze(db_path: str, args: list[str]):
     # Build compact display for Claude — only signal candidates
     signal_lines = []
     for idx, s in enumerate(signal_candidates):
+        symbols = json.loads(s['symbols']) if isinstance(s['symbols'], str) else s['symbols']
         line = (
             f"[{idx}] msg={s['message_id']} chat={s['chat_id']} | "
             f"{s['date']} | {s['chat_title']}\n"
             f"  Text: {s['text_compressed']}\n"
-            f"  Pre: event={s['event_type']} sent={s['sentiment']}({s['sentiment_label']}) "
-            f"scope={s['scope']} int={s['intensity']} urg={s['urgency']} "
-            f"hint={s['action_hint']} tokens={s['affected_tokens']}\n"
+            f"  Pre: dir={s['direction']} mag={s['magnitude']} urg={s['urgency']} "
+            f"conf={s['confidence']} half={s['halflife_min']}min "
+            f"event={s['event_type']} symbols={symbols}\n"
             f"  Reason: {s['reasoning']}"
         )
         signal_lines.append(line)
@@ -478,48 +430,10 @@ def cmd_preanalyze(db_path: str, args: list[str]):
 
 
 def cmd_init(db_path: str):
-    """Create claude_factors table if not exists, and migrate missing columns."""
-    from sqlalchemy import text
+    """Create signal_factors table if not exists (uses new schema via SQLAlchemy)."""
     storage = _get_storage(db_path)
-    with storage.engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS claude_factors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id BIGINT NOT NULL,
-                chat_id BIGINT NOT NULL,
-                sentiment INTEGER,
-                sentiment_label VARCHAR(20),
-                event_type VARCHAR(32),
-                scope VARCHAR(16),
-                intensity INTEGER,
-                urgency INTEGER,
-                affected_tokens TEXT,
-                action_hint VARCHAR(16),
-                reasoning TEXT,
-                cross_refs TEXT,
-                is_signal BOOLEAN DEFAULT 1,
-                analysis_mode VARCHAR(16),
-                llm_status VARCHAR(20) DEFAULT 'completed',
-                llm_model VARCHAR(64),
-                llm_raw TEXT,
-                factor_version INTEGER DEFAULT 1,
-                created_at DATETIME DEFAULT (datetime('now')),
-                updated_at DATETIME DEFAULT (datetime('now')),
-                UNIQUE(message_id, chat_id)
-            )
-        """))
-        # Migrate: add is_signal column if missing (older tables)
-        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(claude_factors)"))]
-        if "is_signal" not in cols:
-            conn.execute(text("ALTER TABLE claude_factors ADD COLUMN is_signal BOOLEAN DEFAULT 1"))
-        if "analysis_mode" not in cols:
-            conn.execute(text("ALTER TABLE claude_factors ADD COLUMN analysis_mode VARCHAR(16)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_chat_id ON claude_factors(chat_id)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_action_hint ON claude_factors(action_hint)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_is_signal ON claude_factors(is_signal)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_claude_factors_llm_status ON claude_factors(llm_status)"))
-        conn.commit()
-    print("OK: claude_factors table ready")
+    storage.init_db()
+    print("OK: signal_factors table ready (new schema)")
 
 
 def cmd_fetch(db_path: str, args: list[str]):
@@ -527,7 +441,6 @@ def cmd_fetch(db_path: str, args: list[str]):
     from sqlalchemy import text
     storage = _get_storage(db_path)
 
-    # Parse args
     count = 50
     chat_id = None
     date_from = None
@@ -555,8 +468,6 @@ def cmd_fetch(db_path: str, args: list[str]):
         else:
             i += 1
 
-    # Fetch messages — over-fetch to account for noise filtering
-    # Request more than needed so we still get ~count after filtering
     fetch_count = count * 3 if not include_all else count
     from datetime import datetime
     from tgwatcher.tz_utils import local_to_utc, utc_to_local
@@ -574,12 +485,10 @@ def cmd_fetch(db_path: str, args: list[str]):
     )
     messages = result["messages"]
 
-    # If not overwrite, batch-filter out messages already in claude_factors
+    # If not overwrite, batch-filter out messages already in signal_factors
     if not overwrite and messages:
         with storage.engine.connect() as conn:
-            # Batch query instead of per-row
             pairs = [(m["message_id"], m["chat_id"]) for m in messages]
-            # SQLite has variable limit (999), chunk if needed
             chunk_size = 900
             existing_ids: set[tuple[int, int]] = set()
             for c_start in range(0, len(pairs), chunk_size):
@@ -590,7 +499,7 @@ def cmd_fetch(db_path: str, args: list[str]):
                     params[f"mid{j}"] = mid
                     params[f"cid{j}"] = cid
                 rows = conn.execute(text(
-                    f"SELECT message_id, chat_id FROM claude_factors "
+                    f"SELECT message_id, chat_id FROM signal_factors "
                     f"WHERE (message_id, chat_id) IN ({placeholders}) "
                     f"AND llm_status='completed'"
                 ), params).fetchall()
@@ -612,21 +521,7 @@ def cmd_fetch(db_path: str, args: list[str]):
                 filtered.append(m)
         messages = filtered
 
-    # Trim to requested count (newest first since query_messages returns DESC)
     messages = messages[:count]
-
-    # Also fetch existing DeepSeek factors for context
-    factors_map = {}
-    for msg in messages:
-        sf = storage.get_signal_factor(msg["message_id"], msg["chat_id"])
-        if sf:
-            factors_map[f"{msg['message_id']}_{msg['chat_id']}"] = {
-                "sentiment": sf.get("sentiment"),
-                "sentiment_label": sf.get("sentiment_label"),
-                "event_type": sf.get("event_type"),
-                "urgency": sf.get("urgency"),
-                "reasoning": sf.get("reasoning"),
-            }
 
     # Format messages for prompt
     formatted_lines = []
@@ -651,7 +546,6 @@ def cmd_fetch(db_path: str, args: list[str]):
     output = {
         "messages": messages,
         "formatted": "\n".join(formatted_lines),
-        "existing_factors": factors_map,
         "total_available": result["total"],
         "fetched": len(messages),
         "noise_filter": {
@@ -678,7 +572,7 @@ def cmd_fetch(db_path: str, args: list[str]):
 
 
 def cmd_write(db_path: str, results_file: str, args: list[str]):
-    """Write analysis results from JSON file to claude_factors table."""
+    """Write analysis results from JSON file to signal_factors table."""
     from sqlalchemy import text
     storage = _get_storage(db_path)
 
@@ -693,7 +587,6 @@ def cmd_write(db_path: str, results_file: str, args: list[str]):
     with open(results_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Support both array and object with per_message key
     if isinstance(data, dict):
         items = data.get("per_message", [data])
     else:
@@ -702,43 +595,45 @@ def cmd_write(db_path: str, results_file: str, args: list[str]):
     written = 0
     with storage.engine.connect() as conn:
         for item in items:
+            # Convert symbols list to JSON string if needed
+            symbols = item.get("symbols", [])
+            if isinstance(symbols, list):
+                symbols = json.dumps(symbols, ensure_ascii=False)
+
             row = {
                 "message_id": item["message_id"],
                 "chat_id": item["chat_id"],
-                "sentiment": item.get("sentiment"),
-                "sentiment_label": item.get("sentiment_label"),
-                "event_type": item.get("event_type"),
-                "scope": item.get("scope"),
-                "intensity": item.get("intensity"),
+                "direction": item.get("direction"),
+                "magnitude": item.get("magnitude"),
                 "urgency": item.get("urgency"),
-                "affected_tokens": json.dumps(item.get("affected_tokens", []), ensure_ascii=False),
-                "action_hint": item.get("action_hint"),
+                "confidence": item.get("confidence"),
+                "halflife_min": item.get("halflife_min"),
+                "symbols": symbols,
+                "event_type": item.get("event_type"),
                 "reasoning": item.get("reasoning"),
-                "cross_refs": json.dumps(item.get("cross_refs", []), ensure_ascii=False),
-                "is_signal": 1 if item.get("is_signal", True) else 0,
-                "analysis_mode": mode,
                 "llm_status": "completed",
                 "llm_model": "claude",
                 "llm_raw": json.dumps(item, ensure_ascii=False),
+                "factor_version": 2,
             }
             existing = conn.execute(text(
-                "SELECT id FROM claude_factors WHERE message_id=:mid AND chat_id=:cid"
+                "SELECT id FROM signal_factors WHERE message_id=:mid AND chat_id=:cid"
             ), {"mid": row["message_id"], "cid": row["chat_id"]}).fetchone()
             if existing:
                 set_parts = [f"{k}=:{k}" for k in row.keys() if k not in ("message_id", "chat_id")]
                 set_clause = ", ".join(set_parts)
                 conn.execute(text(
-                    f"UPDATE claude_factors SET {set_clause}, updated_at=datetime('now') "
+                    f"UPDATE signal_factors SET {set_clause}, updated_at=datetime('now') "
                     f"WHERE message_id=:message_id AND chat_id=:chat_id"
                 ), row)
             else:
                 cols = ", ".join(row.keys())
                 vals = ", ".join(f":{k}" for k in row.keys())
-                conn.execute(text(f"INSERT INTO claude_factors ({cols}) VALUES ({vals})"), row)
+                conn.execute(text(f"INSERT INTO signal_factors ({cols}) VALUES ({vals})"), row)
             written += 1
         conn.commit()
 
-    print(f"OK: wrote {written} results to claude_factors (mode={mode})")
+    print(f"OK: wrote {written} results to signal_factors (mode={mode})")
 
 
 def cmd_stats(db_path: str):
@@ -752,32 +647,41 @@ def cmd_stats(db_path: str):
         ds_done = conn.execute(text(
             "SELECT COUNT(*) FROM signal_factors WHERE llm_status='completed'"
         )).scalar()
-        claude_done = conn.execute(text(
-            "SELECT COUNT(*) FROM claude_factors WHERE llm_status='completed'"
+        # Direction distribution
+        bullish = conn.execute(text(
+            "SELECT COUNT(*) FROM signal_factors WHERE direction > 0 AND llm_status='completed'"
         )).scalar()
-        claude_signals = conn.execute(text(
-            "SELECT COUNT(*) FROM claude_factors WHERE is_signal=1 AND llm_status='completed'"
+        bearish = conn.execute(text(
+            "SELECT COUNT(*) FROM signal_factors WHERE direction < 0 AND llm_status='completed'"
         )).scalar()
-        claude_noise = conn.execute(text(
-            "SELECT COUNT(*) FROM claude_factors WHERE is_signal=0 AND llm_status='completed'"
+        neutral = conn.execute(text(
+            "SELECT COUNT(*) FROM signal_factors WHERE direction = 0 AND llm_status='completed'"
         )).scalar()
-        claude_by_mode = {}
+        # Event type distribution
+        event_dist = {}
         for row in conn.execute(text(
-            "SELECT analysis_mode, COUNT(*) as cnt FROM claude_factors "
-            "WHERE llm_status='completed' GROUP BY analysis_mode"
+            "SELECT event_type, COUNT(*) as cnt FROM signal_factors "
+            "WHERE event_type IS NOT NULL AND llm_status='completed' GROUP BY event_type"
         )):
-            claude_by_mode[row[0] or "unknown"] = row[1]
-        action_dist = {}
-        for row in conn.execute(text(
-            "SELECT action_hint, COUNT(*) as cnt FROM claude_factors "
-            "WHERE action_hint IS NOT NULL GROUP BY action_hint"
-        )):
-            action_dist[row[0]] = row[1]
-        # Top affected tokens (signals only)
+            event_dist[row[0]] = row[1]
+        # Averages
+        avg_direction = conn.execute(text(
+            "SELECT AVG(direction) FROM signal_factors WHERE direction IS NOT NULL AND llm_status='completed'"
+        )).scalar()
+        avg_magnitude = conn.execute(text(
+            "SELECT AVG(magnitude) FROM signal_factors WHERE magnitude IS NOT NULL AND llm_status='completed'"
+        )).scalar()
+        avg_confidence = conn.execute(text(
+            "SELECT AVG(confidence) FROM signal_factors WHERE confidence IS NOT NULL AND llm_status='completed'"
+        )).scalar()
+        avg_halflife = conn.execute(text(
+            "SELECT AVG(halflife_min) FROM signal_factors WHERE halflife_min IS NOT NULL AND llm_status='completed'"
+        )).scalar()
+        # Top symbols
         token_counts: dict[str, int] = {}
         for row in conn.execute(text(
-            "SELECT affected_tokens FROM claude_factors "
-            "WHERE affected_tokens IS NOT NULL AND is_signal=1"
+            "SELECT symbols FROM signal_factors "
+            "WHERE symbols IS NOT NULL AND llm_status='completed'"
         )):
             try:
                 tokens = json.loads(row[0])
@@ -786,27 +690,18 @@ def cmd_stats(db_path: str):
             except (json.JSONDecodeError, TypeError):
                 pass
         top_tokens = sorted(token_counts.items(), key=lambda x: -x[1])[:10]
-        # Event type distribution (signals only)
-        event_dist = {}
-        for row in conn.execute(text(
-            "SELECT event_type, COUNT(*) as cnt FROM claude_factors "
-            "WHERE is_signal=1 AND event_type IS NOT NULL GROUP BY event_type"
-        )):
-            event_dist[row[0]] = row[1]
 
-    pct_ds = ds_done * 100 // max(total, 1)
-    pct_claude = claude_done * 100 // max(total, 1)
-    signal_pct = claude_signals * 100 // max(claude_done, 1)
-    print(f"TGWatcher Analysis Coverage:")
+    pct = ds_done * 100 // max(total, 1)
+    print(f"TGWatcher Analysis Coverage (v2 schema):")
     print(f"  Total messages:       {total}")
-    print(f"  DeepSeek analyzed:    {ds_done} ({pct_ds}%)")
-    print(f"  Claude analyzed:      {claude_done} ({pct_claude}%)")
-    print(f"    Signals (is_signal=1): {claude_signals} ({signal_pct}%)")
-    print(f"    Noise  (is_signal=0):  {claude_noise} ({100 - signal_pct}%)")
-    print(f"  Claude by mode:       {claude_by_mode}")
-    print(f"  Signal event types:   {event_dist}")
-    print(f"  Action hints:         {action_dist}")
-    print(f"  Top affected tokens:  {top_tokens}")
+    print(f"  Analyzed:             {ds_done} ({pct}%)")
+    print(f"  Direction:            bullish={bullish}, neutral={neutral}, bearish={bearish}")
+    print(f"  Event types:          {event_dist}")
+    print(f"  Avg direction:        {avg_direction:.3f}" if avg_direction else "  Avg direction:        -")
+    print(f"  Avg magnitude:        {avg_magnitude:.3f}" if avg_magnitude else "  Avg magnitude:        -")
+    print(f"  Avg confidence:       {avg_confidence:.3f}" if avg_confidence else "  Avg confidence:       -")
+    print(f"  Avg halflife (min):   {avg_halflife:.1f}" if avg_halflife else "  Avg halflife (min):   -")
+    print(f"  Top symbols:          {top_tokens}")
 
 
 def main():

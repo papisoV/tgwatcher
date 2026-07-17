@@ -388,9 +388,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
     <div class="export-section">
       <div class="export-section__label">分析来源</div>
       <div class="export-format-row">
-        <label class="export-format-label"><input type="radio" name="signalExportSource" value="claude" checked onchange="updateSignalExportPreview()"> Claude</label>
-        <label class="export-format-label"><input type="radio" name="signalExportSource" value="deepseek" onchange="updateSignalExportPreview()"> DeepSeek</label>
-        <label class="export-format-label"><input type="radio" name="signalExportSource" value="both" onchange="updateSignalExportPreview()"> 对比</label>
+
       </div>
     </div>
     <div class="export-section">
@@ -402,7 +400,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
       </div>
     </div>
     <div class="export-section">
-      <label class="export-format-label"><input type="checkbox" id="signalExportSignalOnly" checked onchange="updateSignalExportPreview()"> 仅导出信号（排除噪音）</label>
+
     </div>
     <div class="export-preview" id="signalExportPreview">选择日期范围后显示信号数量</div>
     <div class="modal-actions">
@@ -573,9 +571,9 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
         <div class="dashboard-body">
           <div class="kpi-row" id="signalKpiRow">
             <div class="kpi-card"><div class="kpi-value" id="signalKpiTotal">-</div><div class="kpi-label">已分析</div></div>
-            <div class="kpi-card"><div class="kpi-value" id="signalKpiBullish">-</div><div class="kpi-label">看涨%</div></div>
-            <div class="kpi-card"><div class="kpi-value" id="signalKpiBearish">-</div><div class="kpi-label">看跌%</div></div>
-            <div class="kpi-card"><div class="kpi-value" id="signalKpiUrgency">-</div><div class="kpi-label">平均紧急度</div></div>
+            <div class="kpi-card"><div class="kpi-value" id="signalKpiBullish">-</div><div class="kpi-label">利多%</div></div>
+            <div class="kpi-card"><div class="kpi-value" id="signalKpiBearish">-</div><div class="kpi-label">利空%</div></div>
+            <div class="kpi-card"><div class="kpi-value" id="signalKpiUrgency">-</div><div class="kpi-label">平均幅度</div></div>
           </div>
           <div class="chart-section">
             <div class="chart-section__title">情绪趋势</div>
@@ -588,7 +586,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
               <div style="overflow:auto;max-height:300px">
                 <table class="data-table">
                   <thead><tr>
-                    <th>时间</th><th>情绪</th><th>事件</th><th>范围</th><th>强度</th><th>紧急</th><th style="max-width:200px">内容</th>
+                    <th>时间</th><th>方向</th><th>事件</th><th>幅度</th><th>紧急</th><th>置信</th><th>半衰期</th><th style="max-width:150px">内容</th>
                   </tr></thead>
                   <tbody id="signalTableBody"></tbody>
                 </table>

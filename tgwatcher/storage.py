@@ -14,7 +14,7 @@ from tgwatcher.tz_utils import utc_now, local_to_utc, sql_tz_shift, tz_offset_ho
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Storage:
@@ -63,6 +63,8 @@ class Storage:
             self._migrate_v2_to_v3()
         if from_version < 4:
             self._migrate_v3_to_v4()
+        if from_version < 5:
+            self._migrate_v4_to_v5()
 
     def _migrate_v1_to_v2(self) -> None:
         logger.info("Migrating schema v1 -> v2 ...")
@@ -120,6 +122,19 @@ class Storage:
         Base.metadata.create_all(self.engine, tables=[SignalFactor.__table__])
         self._set_schema_version(4)
         logger.info("Migration v3 -> v4 complete")
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Drop old signal_factors and claude_factors tables, recreate with new schema."""
+        logger.info("Migrating schema v4 -> v5 (new factor schema) ...")
+        with self.engine.connect() as conn:
+            # Drop old tables — data is being discarded per user request
+            conn.execute(text("DROP TABLE IF EXISTS signal_factors"))
+            conn.execute(text("DROP TABLE IF EXISTS claude_factors"))
+            conn.commit()
+        # Recreate with new schema
+        Base.metadata.create_all(self.engine, tables=[SignalFactor.__table__])
+        self._set_schema_version(5)
+        logger.info("Migration v4 -> v5 complete (old factor data discarded)")
 
     def get_session(self) -> Session:
         return self._session_factory()
@@ -588,22 +603,25 @@ class Storage:
                 return None
         return {c.name: getattr(sf, c.name) for c in sf.__table__.columns}
 
-    def query_signal_factors(self, chat_id: int | None = None, sentiment: str | None = None,
-                             event_type: str | None = None, scope: str | None = None,
+    def query_signal_factors(self, chat_id: int | None = None,
+                             event_type: str | None = None,
+                             direction: str | None = None,
                              date_from: datetime | None = None, date_to: datetime | None = None,
                              page: int = 1, page_size: int = 50) -> dict:
         with self.get_session() as session:
             q = session.query(SignalFactor, Message).join(
                 Message, (SignalFactor.message_id == Message.message_id) & (SignalFactor.chat_id == Message.chat_id)
-            )
+            ).filter(SignalFactor.llm_status == "completed")
             if chat_id:
                 q = q.filter(SignalFactor.chat_id == chat_id)
-            if sentiment:
-                q = q.filter(SignalFactor.sentiment_label == sentiment)
             if event_type:
                 q = q.filter(SignalFactor.event_type == event_type)
-            if scope:
-                q = q.filter(SignalFactor.scope == scope)
+            if direction == "bullish":
+                q = q.filter(SignalFactor.direction > 0)
+            elif direction == "bearish":
+                q = q.filter(SignalFactor.direction < 0)
+            elif direction == "neutral":
+                q = q.filter(SignalFactor.direction == 0)
             if date_from:
                 q = q.filter(Message.date >= date_from)
             if date_to:
@@ -621,7 +639,7 @@ class Storage:
     def get_signal_stats(self, chat_id: int | None = None,
                          date_from: datetime | None = None, date_to: datetime | None = None) -> dict:
         with self.get_session() as session:
-            q = session.query(SignalFactor)
+            q = session.query(SignalFactor).filter(SignalFactor.llm_status == "completed")
             if chat_id:
                 q = q.filter(SignalFactor.chat_id == chat_id)
             if date_from or date_to:
@@ -631,27 +649,34 @@ class Storage:
                 if date_to:
                     q = q.filter(Message.date <= date_to)
             total = q.count()
-            completed = q.filter(SignalFactor.llm_status == "completed").count()
-            failed = q.filter(SignalFactor.llm_status == "failed").count()
-            skipped = q.filter(SignalFactor.llm_status == "skipped").count()
-            # Sentiment distribution
-            sentiment_counts = {}
-            for label in ["bullish", "neutral", "bearish"]:
-                sentiment_counts[label] = q.filter(SignalFactor.sentiment_label == label).count()
+            # Direction distribution
+            bullish = q.filter(SignalFactor.direction > 0).count()
+            bearish = q.filter(SignalFactor.direction < 0).count()
+            neutral = q.filter(SignalFactor.direction == 0).count()
             # Event type distribution
             event_types = [r[0] for r in session.query(SignalFactor.event_type).filter(
                 SignalFactor.event_type.isnot(None)).distinct().all()]
             event_counts = {et: q.filter(SignalFactor.event_type == et).count() for et in event_types}
             # Averages
-            avg_intensity = session.query(func.avg(SignalFactor.intensity)).filter(
-                SignalFactor.intensity.isnot(None)).scalar()
+            avg_direction = session.query(func.avg(SignalFactor.direction)).filter(
+                SignalFactor.direction.isnot(None)).scalar()
+            avg_magnitude = session.query(func.avg(SignalFactor.magnitude)).filter(
+                SignalFactor.magnitude.isnot(None)).scalar()
             avg_urgency = session.query(func.avg(SignalFactor.urgency)).filter(
                 SignalFactor.urgency.isnot(None)).scalar()
+            avg_confidence = session.query(func.avg(SignalFactor.confidence)).filter(
+                SignalFactor.confidence.isnot(None)).scalar()
+            avg_halflife = session.query(func.avg(SignalFactor.halflife_min)).filter(
+                SignalFactor.halflife_min.isnot(None)).scalar()
         return {
-            "total": total, "completed": completed, "failed": failed, "skipped": skipped,
-            "sentiment": sentiment_counts, "event_types": event_counts,
-            "avg_intensity": round(avg_intensity, 2) if avg_intensity else None,
-            "avg_urgency": round(avg_urgency, 2) if avg_urgency else None,
+            "total": total,
+            "direction": {"bullish": bullish, "neutral": neutral, "bearish": bearish},
+            "event_types": event_counts,
+            "avg_direction": round(avg_direction, 3) if avg_direction else None,
+            "avg_magnitude": round(avg_magnitude, 3) if avg_magnitude else None,
+            "avg_urgency": round(avg_urgency, 3) if avg_urgency else None,
+            "avg_confidence": round(avg_confidence, 3) if avg_confidence else None,
+            "avg_halflife_min": round(avg_halflife, 1) if avg_halflife else None,
         }
 
     def get_unprocessed_messages(self, chat_id: int | None = None,
@@ -690,7 +715,8 @@ class Storage:
             extra_days = 1 if tz_offset_hours() > 0 else 0
             q = session.query(
                 func.date(Message.date, tz_shift).label("date"),
-                SignalFactor.sentiment_label,
+                func.avg(SignalFactor.direction).label("avg_direction"),
+                func.avg(SignalFactor.magnitude).label("avg_magnitude"),
                 func.count().label("count"),
             ).join(
                 SignalFactor, (Message.message_id == SignalFactor.message_id) & (Message.chat_id == SignalFactor.chat_id)
@@ -700,14 +726,15 @@ class Storage:
             )
             if chat_id:
                 q = q.filter(Message.chat_id == chat_id)
-            rows = q.group_by(func.date(Message.date, tz_shift), SignalFactor.sentiment_label).order_by(func.date(Message.date, tz_shift)).all()
+            rows = q.group_by(func.date(Message.date, tz_shift)).order_by(func.date(Message.date, tz_shift)).all()
         trend = {}
         for r in rows:
             date_str = str(r.date)
-            if date_str not in trend:
-                trend[date_str] = {"bullish": 0, "neutral": 0, "bearish": 0}
-            if r.sentiment_label in trend[date_str]:
-                trend[date_str][r.sentiment_label] = r.count
+            trend[date_str] = {
+                "avg_direction": round(r.avg_direction, 3) if r.avg_direction else 0,
+                "avg_magnitude": round(r.avg_magnitude, 3) if r.avg_magnitude else 0,
+                "count": r.count,
+            }
         return {"period": period, "days": days, "trend": trend}
 
     def delete_signal_factors_by_chat(self, chat_id: int) -> int:

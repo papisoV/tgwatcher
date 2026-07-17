@@ -40,7 +40,7 @@ signal:
   batch_size: 50
   llm_batch_size: 15
   llm_delay: 1.0
-  factor_version: 1
+  factor_version: 2
   keywords:
     bullish:
     - "利好"
@@ -108,23 +108,21 @@ signal:
     - "投资"
     - "收购"
     - "生态"
-    scope_macro:
-    - "美联储"
-    - CPI
-    - GDP
-    - "战争"
-    - "制裁"
-    - "法案"
-    - "全球"
-    - "市场"
-    - "整体"
-    scope_micro:
-    - "上线"
-    - "合作"
-    - "集成"
-    - "空投"
-    - "代币"
-    - "项目"
+    event_whale:
+    - "鲸鱼"
+    - "巨鲸"
+    - "大额转账"
+    - "大额转移"
+    - "政府抛售"
+    - "国家抛售"
+    - "机构买入"
+    - "机构卖出"
+    - MicroStrategy
+    - "持仓"
+    - "增持"
+    - "冷钱包"
+    - "热钱包"
+    - "钱包异动"
     urgency_high:
     - "紧急"
     - "暴跌"
