@@ -186,21 +186,24 @@ def _auto_poll_loop() -> None:
         try:
             time.sleep(1)
             now = time.time()
+            # Skip if any crawl currently running — leave next_tick_at untouched so
+            # the tick fires as soon as the running crawl finishes (no lost tick).
+            if _crawl_service and _crawl_service.status.get("running"):
+                continue
             with _auto_poll_lock:
                 due = [
                     (cid, s) for cid, s in _auto_poll_state.items()
                     if s["enabled"] and now >= s["next_tick_at"]
                 ]
-                # Reschedule immediately so countdown doesn't drift
-                for cid, s in due:
-                    s["next_tick_at"] = now + s["interval"]
-            if not due:
-                continue
-            # Skip if any crawl currently running
-            if _crawl_service and _crawl_service.status.get("running"):
-                continue
-            # Trigger single-group incremental crawl for the most-due group
-            cid, s = due[0]
+                if not due:
+                    continue
+                # Trigger only the most-due group; reschedule all due so they don't pile up.
+                due.sort(key=lambda cs: cs[1]["next_tick_at"])
+                cid, s = due[0]
+                s["next_tick_at"] = now + s["interval"]
+                # Other due groups: reschedule to next cycle too (avoid back-to-back stacking)
+                for other_cid, other_s in due[1:]:
+                    other_s["next_tick_at"] = now + other_s["interval"]
             logger.info("Auto-poll: triggering incremental crawl for %s (%s)", s.get("name"), cid)
             try:
                 if _crawl_service:
