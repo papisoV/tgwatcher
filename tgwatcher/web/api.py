@@ -152,6 +152,70 @@ def init_services(config, async_loop=None) -> None:
                 _crawl_service.start(mode="catchup")
             threading.Thread(target=_delayed_catchup, daemon=True).start()
 
+    # Auto-poll daemon — per-group periodic incremental crawl
+    _init_auto_poll(config)
+    threading.Thread(target=_auto_poll_loop, daemon=True, name="auto-poll").start()
+
+
+# ── Auto-poll state ─────────────────────────────────────────────────────
+_auto_poll_state: dict[int, dict] = {}  # {chat_id: {enabled, interval, next_tick_at, name}}
+_auto_poll_lock = threading.Lock()
+
+
+def _init_auto_poll(config: dict) -> None:
+    """Populate _auto_poll_state from config (called at startup)."""
+    with _auto_poll_lock:
+        _auto_poll_state.clear()
+        now = time.time()
+        for g in config.get("groups", []):
+            gid = g.get("id")
+            if not gid:
+                continue
+            _auto_poll_state[gid] = {
+                "enabled": bool(g.get("auto_poll", False)),
+                "interval": int(g.get("poll_interval_seconds", 15)),
+                "next_tick_at": now + int(g.get("poll_interval_seconds", 15)),
+                "name": g.get("name", str(gid)),
+            }
+
+
+def _auto_poll_loop() -> None:
+    """Daemon thread: every 1s, scan _auto_poll_state for due ticks and fire incremental crawl."""
+    logger.info("Auto-poll daemon started")
+    while True:
+        try:
+            time.sleep(1)
+            now = time.time()
+            with _auto_poll_lock:
+                due = [
+                    (cid, s) for cid, s in _auto_poll_state.items()
+                    if s["enabled"] and now >= s["next_tick_at"]
+                ]
+                # Reschedule immediately so countdown doesn't drift
+                for cid, s in due:
+                    s["next_tick_at"] = now + s["interval"]
+            if not due:
+                continue
+            # Skip if any crawl currently running
+            if _crawl_service and _crawl_service.status.get("running"):
+                continue
+            # Trigger single-group incremental crawl for the most-due group
+            cid, s = due[0]
+            logger.info("Auto-poll: triggering incremental crawl for %s (%s)", s.get("name"), cid)
+            try:
+                if _crawl_service:
+                    _crawl_service.start(mode="incremental", group_id=cid)
+            except Exception as e:
+                logger.warning("Auto-poll crawl start failed: %s", e)
+            push_sse_event("auto_poll_tick", {
+                "chat_id": cid,
+                "name": s.get("name"),
+                "next_tick_at": s["next_tick_at"],
+                "interval": s["interval"],
+            })
+        except Exception as e:
+            logger.warning("Auto-poll loop error: %s", e)
+
 
 def _init_signal_engine(config: dict) -> None:
     """Initialize signal engine, LLM client, and service. Called from init_services."""
@@ -447,6 +511,8 @@ def export_signals():
     date_to = request.args.get("date_to", type=str)
     event_type = request.args.get("event_type", type=str)
     direction = request.args.get("direction", type=str)
+    llm_model = request.args.get("llm_model", type=str)
+    is_signal = request.args.get("is_signal", type=str)
     count_only = request.args.get("count_only", "").lower() == "true"
 
     df = local_to_utc(datetime.fromisoformat(date_from)) if date_from else None
@@ -477,6 +543,13 @@ def export_signals():
             where_clauses.append("f.direction > 0")
         elif direction == "bearish":
             where_clauses.append("f.direction < 0")
+        if llm_model:
+            where_clauses.append("f.llm_model = :llm_model")
+            params["llm_model"] = llm_model
+        if is_signal == "true":
+            where_clauses.append("f.is_signal = 1")
+        elif is_signal == "false":
+            where_clauses.append("f.is_signal = 0")
 
         where = " AND ".join(where_clauses)
 
@@ -582,6 +655,64 @@ def export_signals():
         return Response("\n".join(lines), mimetype="text/markdown",
                         headers={"Content-Disposition": "attachment; filename=signals_export.md"})
 
+    if fmt == "sqlite":
+        import tempfile
+        from sqlalchemy import create_engine as ce
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        eng = ce(f"sqlite:///{tmp_path}")
+        with eng.connect() as c:
+            c.execute(sql_text("PRAGMA journal_mode=WAL"))
+            c.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS tg_factors (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    msg_id       INTEGER NOT NULL,
+                    ts           TEXT NOT NULL,
+                    symbols      TEXT NOT NULL,
+                    direction    REAL NOT NULL,
+                    magnitude    REAL NOT NULL,
+                    urgency      REAL NOT NULL,
+                    confidence   REAL NOT NULL,
+                    halflife_min INTEGER NOT NULL,
+                    event_type   TEXT NOT NULL,
+                    reasoning    TEXT NOT NULL,
+                    created_at   TEXT DEFAULT (datetime('now')),
+                    UNIQUE(msg_id)
+                )
+            """))
+            c.execute(sql_text("CREATE INDEX IF NOT EXISTS idx_tg_factors_ts ON tg_factors(ts)"))
+            c.execute(sql_text("CREATE INDEX IF NOT EXISTS idx_tg_factors_event_type ON tg_factors(event_type)"))
+            for r in rows:
+                sym_list = r.get("symbols", [])
+                if not sym_list:
+                    sym_list = ["*"]
+                symbols_json = json.dumps(sym_list, ensure_ascii=False)
+                ts_val = r.get("date", "")
+                c.execute(sql_text("""
+                    INSERT OR REPLACE INTO tg_factors
+                    (msg_id, ts, symbols, direction, magnitude, urgency, confidence, halflife_min, event_type, reasoning)
+                    VALUES (:msg_id, :ts, :symbols, :direction, :magnitude, :urgency, :confidence, :halflife_min, :event_type, :reasoning)
+                """), {
+                    "msg_id": r["message_id"],
+                    "ts": ts_val,
+                    "symbols": symbols_json,
+                    "direction": r.get("direction", 0.0) or 0.0,
+                    "magnitude": r.get("magnitude", 0.1) or 0.1,
+                    "urgency": r.get("urgency", 0.1) or 0.1,
+                    "confidence": r.get("confidence", 0.9) or 0.9,
+                    "halflife_min": r.get("halflife_min", 60) or 60,
+                    "event_type": r.get("event_type", "other") or "other",
+                    "reasoning": r.get("reasoning", "") or "",
+                })
+            c.commit()
+        eng.dispose()
+        with open(tmp_path, "rb") as f:
+            db_bytes = f.read()
+        os.unlink(tmp_path)
+        return Response(db_bytes, mimetype="application/x-sqlite3",
+                        headers={"Content-Disposition": "attachment; filename=tg_factors.db"})
+
     return jsonify(rows)
 
 
@@ -648,6 +779,81 @@ def stop_crawl():
 @require_auth
 def crawl_status():
     return jsonify(_crawl_service.status)
+
+
+@api.route("/crawl/auto-poll", methods=["GET"])
+@require_auth
+def get_auto_poll():
+    """Return per-group auto-poll state with countdown to next tick."""
+    now = time.time()
+    with _auto_poll_lock:
+        result = []
+        for cid, s in _auto_poll_state.items():
+            result.append({
+                "chat_id": cid,
+                "name": s.get("name", str(cid)),
+                "enabled": s["enabled"],
+                "interval_seconds": s["interval"],
+                "remaining_seconds": max(0, int(s["next_tick_at"] - now)) if s["enabled"] else None,
+            })
+    return jsonify(result)
+
+
+@api.route("/crawl/auto-poll/<int:chat_id>", methods=["PATCH"])
+@require_auth
+def update_auto_poll(chat_id: int):
+    """Update per-group auto_poll settings and persist to config.yaml."""
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    interval = data.get("interval_seconds")
+    if enabled is None and interval is None:
+        return jsonify({"error": "Provide 'enabled' and/or 'interval_seconds'"}), 400
+
+    # Update in-memory config
+    found = False
+    for g in _config.get("groups", []):
+        if g.get("id") == chat_id:
+            found = True
+            if enabled is not None:
+                g["auto_poll"] = bool(enabled)
+            if interval is not None:
+                try:
+                    iv = int(interval)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "interval_seconds must be int"}), 400
+                if iv < 5 or iv > 3600:
+                    return jsonify({"error": "interval_seconds must be 5-3600"}), 400
+                g["poll_interval_seconds"] = iv
+            break
+    if not found:
+        return jsonify({"error": "Group not found in config"}), 404
+
+    # Persist
+    config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
+    _atomic_write_config(_config, config_path)
+
+    # Update live state
+    with _auto_poll_lock:
+        s = _auto_poll_state.get(chat_id)
+        if s is None:
+            s = {"name": str(chat_id)}
+            _auto_poll_state[chat_id] = s
+        if enabled is not None:
+            s["enabled"] = bool(enabled)
+        if interval is not None:
+            s["interval"] = iv
+        s["next_tick_at"] = time.time() + s["interval"]
+        s["name"] = next((g.get("name", str(chat_id)) for g in _config["groups"] if g.get("id") == chat_id), str(chat_id))
+
+    push_sse_event("auto_poll_tick", {
+        "chat_id": chat_id,
+        "name": s.get("name"),
+        "next_tick_at": s["next_tick_at"],
+        "interval": s["interval"],
+        "enabled": s["enabled"],
+    })
+    return jsonify({"status": "updated", "chat_id": chat_id,
+                    "enabled": s["enabled"], "interval_seconds": s["interval"]})
 
 
 # --- Config APIs ---
@@ -773,6 +979,29 @@ def sse_stream():
 
 
 # --- Login API ---
+
+
+@api.route("/auth/bootstrap", methods=["GET"])
+def auth_bootstrap():
+    """Auto-login for localhost: returns the auth token so the browser can
+    store it in localStorage, skipping the manual token entry step.
+
+    Only responds to loopback / same-host requests — the token file already
+    lives on the user's machine, so this just removes the copy-paste step.
+    Remote requests get 403.
+    """
+    ip = request.remote_addr or "unknown"
+    if not _check_rate_limit(f"auth_bootstrap:{ip}", max_requests=10, window=60):
+        return jsonify({"error": "Rate limited"}), 429
+
+    if _auth_token is None:
+        return jsonify({"token": None})
+
+    loopback = {"127.0.0.1", "::1", "localhost"}
+    if ip not in loopback:
+        return jsonify({"error": "Forbidden"}), 403
+
+    return jsonify({"token": _auth_token})
 
 
 @api.route("/login/status", methods=["GET"])

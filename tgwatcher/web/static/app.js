@@ -52,7 +52,19 @@ function setAuthToken(){
 }
 
 async function checkLogin(){
-  if(!authToken){document.getElementById('loginOverlay').style.display='flex';return}
+  if(!authToken){
+    // Try auto-login from localhost bootstrap endpoint first
+    try{
+      const r=await fetch(API+'/api/auth/bootstrap',{headers:{'Content-Type':'application/json'}});
+      if(r.ok){
+        const j=await r.json();
+        if(j&&j.token){
+          authToken=j.token;localStorage.setItem('tgwatcher_token',j.token);
+        }
+      }
+    }catch(e){/* network error — fall back to manual entry */}
+    if(!authToken){document.getElementById('loginOverlay').style.display='flex';return}
+  }
   if(_loginCheckPending)return;_loginCheckPending=true;
   try{
     const r=await api('/api/login/status');
@@ -412,6 +424,10 @@ function _buildSignalExportParams(){
   if(df)params.set('date_from',df);
   const dt=document.getElementById('signalExportDateTo').value;
   if(dt)params.set('date_to',dt);
+  const source=document.querySelector('input[name="signalExportSource"]:checked')?.value;
+  if(source)params.set('llm_model',source);
+  const filter=document.querySelector('input[name="signalExportFilter"]:checked')?.value;
+  if(filter)params.set('is_signal',filter==='signal'?'true':'false');
   return params;
 }
 
@@ -428,8 +444,9 @@ async function doSignalExport(){
   if(!r.ok){showToast('导出失败','error');return}
   const blob=await r.blob();
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  const ext=fmt==='markdown'?'md':fmt;
-  a.download='signals_export.'+ext;a.click();
+  const ext=fmt==='markdown'?'md':fmt==='sqlite'?'db':fmt;
+  const prefix=fmt==='sqlite'?'tg_factors':'signals_export';
+  a.download=prefix+'.'+ext;a.click();
   closeSignalExportModal();
   showToast('已导出信号分析 ('+fmt.toUpperCase()+')','success');
 }
@@ -699,6 +716,8 @@ function _fmtDuration(sec){
 }
 
 // ===== SSE =====
+let autoPollState=[];let autoPollTimer=null;
+
 function connectSSE(){
   if(!authToken)return;
   const es=new EventSource(API+'/api/events?token='+authToken);
@@ -708,8 +727,60 @@ function connectSSE(){
   });
   es.addEventListener('crawl_error',e=>{showToast(e.data,'error')});
   es.addEventListener('signal_process_status',e=>{checkSignalStatus()});
-  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null}};
+  es.addEventListener('auto_poll_tick',e=>{try{const d=JSON.parse(e.data);refreshAutoPollUI()}catch(_){}});
+  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState()};
   es.onerror=()=>{sseConnected=false;es.close();if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);setTimeout(connectSSE,10000)};
+}
+
+// ===== AUTO POLL =====
+async function loadAutoPollState(){
+  const r=await api('/api/crawl/auto-poll');if(!r)return;
+  autoPollState=r;refreshAutoPollUI();
+  if(!autoPollTimer)autoPollTimer=setInterval(refreshAutoPollUI,1000);
+}
+
+function refreshAutoPollUI(){
+  const el=document.getElementById('autoPollNext');if(!el)return;
+  const active=autoPollState.filter(s=>s.enabled);
+  if(active.length===0){el.style.display='none';return}
+  // pick the soonest-expiring one
+  const next=active.reduce((a,b)=>(a.remaining_seconds||0)<(b.remaining_seconds||0)?a:b);
+  el.style.display='inline';
+  const sec=Math.max(0,Math.floor(next.remaining_seconds||0));
+  el.textContent='⟳ '+next.name+' '+sec+'s';
+}
+
+async function openAutoPollModal(){
+  const list=document.getElementById('autoPollList');
+  document.getElementById('autoPollModal').style.display='flex';
+  list.innerHTML='<div style="padding:16px;text-align:center;color:var(--text-2)">加载中...</div>';
+  await loadAutoPollState();
+  if(!autoPollState||autoPollState.length===0){list.innerHTML='<div style="padding:16px;text-align:center;color:var(--text-2)">没有已监控的群组</div>';return}
+  const fmtInterval=(i)=>i<60?i+'s':(i%60===0?(i/60)+'min':Math.round(i/60*10)/10+'min');
+  list.innerHTML=autoPollState.map(s=>{
+    return `<div class="modal-item" style="cursor:default">
+      <div class="modal-item-check" style="background:${s.enabled?'var(--cyan)':'transparent'};color:${s.enabled?'var(--bg-0)':'transparent'};border-color:${s.enabled?'var(--cyan)':'var(--border)'}">✓</div>
+      <div class="modal-item-info"><div class="modal-item-title">${esc(s.name)}</div><div class="modal-item-sub">${s.enabled?'已启用':'已关闭'}</div></div>
+      <label class="toggle-switch" style="margin-right:10px"><input type="checkbox" ${s.enabled?'checked':''} onchange="updateAutoPoll(${s.chat_id},'enabled',this.checked)"><span class="toggle-slider"></span></label>
+      <input type="number" class="filter-input" min="5" max="3600" step="1" value="${s.interval_seconds}" style="width:80px;text-align:right" onkeydown="if(event.key==='Enter'){this.blur()}" onblur="updateAutoPoll(${s.chat_id},'interval',this.value)" /><span style="margin-left:4px;color:var(--text-2);font-size:var(--fs-sm)">秒</span>
+    </div>`;
+  }).join('');
+}
+
+function closeAutoPollModal(){document.getElementById('autoPollModal').style.display='none'}
+
+async function updateAutoPoll(chat_id,field,value){
+  if(field==='interval'){
+    const v=parseInt(value);
+    if(!Number.isFinite(v)||v<5){showToast('间隔最少 5 秒','error');await loadAutoPollState();if(document.getElementById('autoPollModal').style.display==='flex')openAutoPollModal();return}
+    if(v>3600){showToast('间隔最大 3600 秒','error');await loadAutoPollState();if(document.getElementById('autoPollModal').style.display==='flex')openAutoPollModal();return}
+  }
+  const body={};body[field==='enabled'?'enabled':'interval_seconds']=field==='enabled'?value===true:parseInt(value);
+  const r=await api('/api/crawl/auto-poll/'+chat_id,{method:'PATCH',body:JSON.stringify(body)});
+  if(!r||r.error){showToast(r?.error||'更新失败','error');return}
+  showToast('已更新','success');
+  await loadAutoPollState();
+  if(document.getElementById('autoPollModal').style.display==='flex')openAutoPollModal();
 }
 
 // ===== TOAST =====

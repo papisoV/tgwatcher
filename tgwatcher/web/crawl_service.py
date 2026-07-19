@@ -63,13 +63,15 @@ class CrawlService:
         with self._lock:
             return self._status[key]
 
-    def start(self, mode: str = "incremental", offset_date: str | None = None, until_date: str | None = None) -> bool:
+    def start(self, mode: str = "incremental", offset_date: str | None = None,
+              until_date: str | None = None, group_id: int | None = None) -> bool:
         with self._lock:
             if self._status["running"]:
                 return False
         self._stop_event.clear()
         self._crawl_offset_date = offset_date
         self._crawl_until_date = until_date
+        self._crawl_group_id = group_id
 
         # For catchup mode, pre-filter groups with auto_catchup enabled
         if mode == "catchup":
@@ -78,6 +80,12 @@ class CrawlService:
                 return False
             self._catchup_groups = catchup_groups
             total = len(catchup_groups)
+        elif group_id is not None:
+            # Single-group crawl (auto-poll)
+            self._catchup_groups = [g for g in self.config.get("groups", []) if g.get("id") == group_id]
+            if not self._catchup_groups:
+                return False
+            total = 1
         else:
             self._catchup_groups = None
             total = len(self.config.get("groups", []))

@@ -278,6 +278,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
       <input class="login-input" id="authTokenInput" placeholder="认证 Token" autocomplete="off">
       <button class="login-btn" onclick="setAuthToken()">连接</button>
       <div class="login-error" id="loginError0"></div>
+      <div class="login-info">本机访问已自动登录；仅在远程浏览器或缓存被清空时需要手输 Token</div>
       <div class="login-info">Token 在服务器首次启动时打印到控制台，保存在 <code>.tgwatcher_auth</code></div>
       <button class="login-link-btn" onclick="showTokenHelp()">找不到 Token？</button>
       <div class="login-help" id="tokenHelp" style="display:none">
@@ -388,7 +389,17 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
     <div class="export-section">
       <div class="export-section__label">分析来源</div>
       <div class="export-format-row">
-
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="" checked onchange="updateSignalExportPreview()"> 全部</label>
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="claude" onchange="updateSignalExportPreview()"> Claude</label>
+        <label class="export-format-label"><input type="radio" name="signalExportSource" value="rule-engine" onchange="updateSignalExportPreview()"> 规则引擎</label>
+      </div>
+    </div>
+    <div class="export-section">
+      <div class="export-section__label">过滤</div>
+      <div class="export-format-row">
+        <label class="export-format-label"><input type="radio" name="signalExportFilter" value="" checked onchange="updateSignalExportPreview()"> 全部</label>
+        <label class="export-format-label"><input type="radio" name="signalExportFilter" value="signal" onchange="updateSignalExportPreview()"> 仅信号</label>
+        <label class="export-format-label"><input type="radio" name="signalExportFilter" value="noise" onchange="updateSignalExportPreview()"> 仅噪音</label>
       </div>
     </div>
     <div class="export-section">
@@ -397,6 +408,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
         <label class="export-format-label"><input type="radio" name="signalExportFormat" value="json" checked onchange="updateSignalExportPreview()"> JSON</label>
         <label class="export-format-label"><input type="radio" name="signalExportFormat" value="csv" onchange="updateSignalExportPreview()"> CSV</label>
         <label class="export-format-label"><input type="radio" name="signalExportFormat" value="markdown" onchange="updateSignalExportPreview()"> Markdown</label>
+        <label class="export-format-label"><input type="radio" name="signalExportFormat" value="sqlite" onchange="updateSignalExportPreview()"> SQLite</label>
       </div>
     </div>
     <div class="export-section">
@@ -406,6 +418,18 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
     <div class="modal-actions">
       <button class="btn" onclick="closeSignalExportModal()">取消</button>
       <button class="btn btn-cyan" onclick="doSignalExport()">导出</button>
+    </div>
+  </div>
+</div>
+
+<!-- AUTO POLL MODAL -->
+<div class="modal-overlay" id="autoPollModal" style="display:none">
+  <div class="modal-panel" style="width:560px">
+    <h2>自动轮询设置</h2>
+    <p>每个群组单独设置间隔。轮询启动后，Web UI 持续每隔 N 秒自动增量爬取新消息。</p>
+    <div class="modal-list" id="autoPollList"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeAutoPollModal()">关闭</button>
     </div>
   </div>
 </div>
@@ -436,6 +460,8 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
             <div class="crawl-dd-item" onclick="startCrawl('catchup')">补爬 (自动补爬群组)</div>
             <div class="crawl-dd-sep"></div>
             <div class="crawl-dd-item" onclick="showDateRangePanel()">按日期范围</div>
+            <div class="crawl-dd-sep"></div>
+            <div class="crawl-dd-item" onclick="openAutoPollModal()">⚙ 自动轮询设置...</div>
           </div>
         </div>
         <div class="crawl-date-panel" id="crawlDatePanel" style="display:none">
@@ -458,6 +484,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
     <span id="crawlBarDetail">暂无爬取数据</span>
     <span class="crawl-bar__counts" id="crawlBarCounts"></span>
     <span class="crawl-bar__meta" id="crawlBarMeta"></span>
+    <span class="crawl-bar__meta" id="autoPollNext" style="color:var(--cyan);display:none"></span>
     <div class="crawl-bar__progress" id="crawlBarProgress" style="width:0%"></div>
   </div>
   <!-- CRAWL DETAIL PANEL -->
@@ -618,6 +645,6 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
   </div>
 </div>
 
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>
