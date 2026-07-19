@@ -35,3 +35,14 @@ config.yaml.bak
 
 # Playwright CLI
 .playwright-cli/
+
+# One-off batch scripts and data exports (not part of runtime)
+_batch*.py
+insert_batch_*.py
+batch_analyze.py
+batch_review.py
+_claude_batch_analyze.py
+export_tg_factors.py
+messages_export.md
+signal_factors_detail.md
+signal_factors_report.md
