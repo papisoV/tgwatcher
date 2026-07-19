@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -185,7 +185,9 @@ class WebhookDispatcher:
                 "event_type": "other",
                 "reasoning": "Manual test triggered from /api/webhook/test",
                 "signal_score": 0.5 * 0.5 * 0.5 * (0.5 + 0.5 * 0.5),
-                "expires_at": datetime.now(timezone.utc).isoformat(),
+                # Mirrors real payload semantics: timestamp + 2 * halflife_min.
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=120)).isoformat(),
+                "date": datetime.now(timezone.utc).isoformat(),
             },
         }
         body = json.dumps(test_payload, ensure_ascii=False).encode("utf-8")

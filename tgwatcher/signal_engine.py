@@ -348,7 +348,12 @@ class SignalEngine:
         expires_at = None
         if date_dt is not None:
             try:
-                from datetime import timedelta
+                from datetime import timedelta, timezone
+                # Telethon returns aware UTC datetimes, but be defensive —
+                # if a naive datetime slips in (test/replay path), stamp UTC
+                # so downstream always sees a timezone-suffixed ISO string.
+                if date_dt.tzinfo is None:
+                    date_dt = date_dt.replace(tzinfo=timezone.utc)
                 expires_at = (date_dt + timedelta(minutes=int(halflife_min) * 2)).isoformat()
             except (TypeError, ValueError):
                 pass
