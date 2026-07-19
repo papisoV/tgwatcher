@@ -144,15 +144,17 @@ async function saveGroups(){
   const r=await api('/api/config/groups',{method:'PUT',body:JSON.stringify({groups})});
   if(r&&r.status==='updated'){
     closeGroupModal();
-    await loadChats();
     loadGroupsView();
     // Auto-switch to a newly added group so the user immediately sees its messages
     // (rather than being left on page 1 of all-messages where the new group's
     // older messages are buried deep by time-desc sort).
+    // filterChat itself calls loadChats + loadMessages + loadSenders, so we
+    // don't need to call loadChats separately when switching.
     if(newIds.length>0){
       filterChat(newIds[0]);
       showToast('已添加 '+newIds.length+' 个群组，已切换至最新群组','success');
     }else{
+      await loadChats();
       showToast('已保存','success');
     }
   }else showToast('保存失败','error');
@@ -161,7 +163,10 @@ async function saveGroups(){
 // ===== CHATS =====
 function fmtChatTime(dateStr){
   if(!dateStr)return '';
-  const d=new Date(dateStr.replace(' ','T'));
+  // DB stores UTC; append 'Z' so the browser parses as UTC, then getHours()
+  // returns local time (consistent with fmtTime).
+  const iso=(dateStr.includes('T')?dateStr:dateStr.replace(' ','T'))+'Z';
+  const d=new Date(iso);
   if(isNaN(d))return '';
   const now=new Date();
   const diff=(now-d)/1000;
@@ -175,11 +180,11 @@ function fmtChatTime(dateStr){
 }
 async function loadChats(){
   const chats=await api('/api/chats');if(!chats)return;
-  // Sort by last_msg_date desc (most recently active first), nulls last
+  // Sort by last_msg_date desc (most recently active first), nulls last.
+  // Parse as UTC (append 'Z') since DB stores UTC.
   chats.sort((a,b)=>{
-    const da=a.last_msg_date?new Date(a.last_msg_date.replace(' ','T')).getTime():0;
-    const db=b.last_msg_date?new Date(b.last_msg_date.replace(' ','T')).getTime():0;
-    return db-da;
+    const parseTS=s=>s?new Date((s.includes('T')?s:s.replace(' ','T'))+'Z').getTime():0;
+    return parseTS(b.last_msg_date)-parseTS(a.last_msg_date);
   });
   document.getElementById('chatList').innerHTML=chats.map(c=>{
     const typeTag=c.chat_type?`<span style="font-size:10px;color:var(--text-3);margin-left:4px">${c.chat_type==='channel'?'频道':'群组'}</span>`:'';
