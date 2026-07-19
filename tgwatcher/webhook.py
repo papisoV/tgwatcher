@@ -184,6 +184,8 @@ class WebhookDispatcher:
                 "symbols": ["TEST"],
                 "event_type": "other",
                 "reasoning": "Manual test triggered from /api/webhook/test",
+                "signal_score": 0.5 * 0.5 * 0.5 * (0.5 + 0.5 * 0.5),
+                "expires_at": datetime.now(timezone.utc).isoformat(),
             },
         }
         body = json.dumps(test_payload, ensure_ascii=False).encode("utf-8")

@@ -76,6 +76,12 @@ signal:
     # Env overrides (optional):
     #   SIGNAL_LLM_API_KEY — overrides active provider's api_key (OpenAI-protocol)
     #   ANTHROPIC_API_KEY  — overrides anthropic provider's api_key
+  # Dedup: same (symbols + direction_sign + event_type) within window_seconds
+  # only pushes downstream once. Prevents duplicate orders when the same news
+  # is forwarded across multiple groups. In-memory cache, lost on restart.
+  dedup:
+    enabled: true
+    window_seconds: 300  # 5 minutes
   filter:
     min_text_length: 10
     pass_if_any_match: true

@@ -362,9 +362,22 @@ def _init_signal_engine(config: dict) -> None:
 
     keyword_filter = KeywordFilter(signal_cfg)
     llm_client = SignalLLMClient(llm_config)
+
+    # Signal deduper for downstream-facing push. In-memory cache; lost on
+    # restart (acceptable — worst case a few dup pushes in first minutes).
+    # Set to None when disabled so SignalEngine skips the should_emit call.
+    dedup_cfg = signal_cfg.get("dedup", {})
+    deduper = None
+    if dedup_cfg.get("enabled", True):
+        from tgwatcher.signal_dedup import SignalDeduper
+        window = int(dedup_cfg.get("window_seconds", 300))
+        deduper = SignalDeduper(window_seconds=window)
+        logger.info("Signal deduper enabled (window=%ds)", window)
+
     _signal_engine = SignalEngine(
         _storage, keyword_filter, llm_client, signal_cfg,
         webhook_dispatcher=_webhook_dispatcher,
+        deduper=deduper,
     )
 
     def _on_signal_status(status: dict):
@@ -1151,10 +1164,32 @@ def sse_stream():
     if _auth_token and token != _auth_token:
         return jsonify({"error": "Unauthorized"}), 401
 
+    # Last-Event-ID reconnect compensation: browsers automatically send this
+    # header on reconnect after a dropped connection. If present, replay all
+    # buffered events with id > last_id. If absent (fresh connection), start
+    # from current max to avoid flooding new clients with history.
+    last_id_str = request.headers.get("Last-Event-ID")
+    last_id = int(last_id_str) if (last_id_str and last_id_str.isdigit()) else 0
+
     listener_event = threading.Event()
     with _sse_lock:
         _sse_listeners.append(listener_event)
-        last_id = _sse_event_id
+        if last_id == 0:
+            # Fresh connection — start from current max, no replay.
+            last_id = _sse_event_id
+        elif _sse_events and last_id < _sse_events[0]["id"]:
+            # Client's last_id is older than the oldest buffered event —
+            # buffer has rolled past. Start from the oldest available to
+            # avoid permanently stalling. Log warning: client will miss
+            # events between last_id and _sse_events[0]["id"].
+            logger.warning(
+                "SSE reconnect: last_id=%d older than buffer floor=%d; "
+                "client will miss intermediate events. Use webhook + "
+                "/api/signals/export?since=<ts> for full compensation.",
+                last_id, _sse_events[0]["id"],
+            )
+            last_id = _sse_events[0]["id"] - 1
+        # else: last_id is within buffer — normal replay path.
 
     def generate():
         nonlocal last_id

@@ -25,7 +25,8 @@ class BatchResult:
 class SignalEngine:
     def __init__(self, storage: Storage, keyword_filter: KeywordFilter,
                  llm: SignalLLMClient, config: dict,
-                 webhook_dispatcher=None):
+                 webhook_dispatcher=None,
+                 deduper=None):
         self._storage = storage
         self._filter = keyword_filter
         self._llm = llm
@@ -36,6 +37,11 @@ class SignalEngine:
         self._factor_version = config.get("factor_version", 2)
         # Webhook dispatcher (optional). None = no webhook dispatch.
         self._webhook = webhook_dispatcher
+        # Signal deduper (optional). None = no dedup, all is_signal=True
+        # signals are pushed downstream. When set, filters new_signal SSE +
+        # webhook dispatch for same-key signals within window_seconds.
+        # DB writes (signal_factors) are NOT affected — only push is filtered.
+        self._deduper = deduper
 
     def process_message(self, msg: dict) -> dict | None:
         """Process a single message through keyword filter and LLM. Returns factor dict or None."""
@@ -307,11 +313,46 @@ class SignalEngine:
 
     @staticmethod
     def _build_signal_payload(msg: dict, factor: dict) -> dict:
-        """Build the new_signal payload — mirrors /api/signals/export JSON row shape."""
+        """Build the new_signal payload — mirrors /api/signals/export JSON row shape.
+
+        Adds two downstream-facing fields:
+        - expires_at: date + 2 * halflife_min (when the signal is considered stale)
+        - signal_score: normalized [-1,1] score combining direction/magnitude/
+          confidence/urgency. Formula chosen to be a single actionable number
+          for downstream risk gating; adjust here if formula changes.
+        """
         try:
             symbols = json.loads(factor["symbols"]) if factor.get("symbols") else []
         except (json.JSONDecodeError, TypeError):
             symbols = []
+
+        direction = factor.get("direction") or 0
+        magnitude = factor.get("magnitude") or 0
+        urgency = factor.get("urgency") or 0
+        confidence = factor.get("confidence") or 0
+        halflife_min = factor.get("halflife_min") or 60
+
+        # Normalized signal score: direction * magnitude * confidence * (0.5 + 0.5 * urgency)
+        # Range [-1, 1]. Urgency acts as a weight multiplier (high urgency → full weight,
+        # low urgency → half weight). Confidence scales the whole thing down when LLM is unsure.
+        try:
+            signal_score = round(
+                float(direction) * float(magnitude) * float(confidence) * (0.5 + 0.5 * float(urgency)),
+                4,
+            )
+        except (TypeError, ValueError):
+            signal_score = 0.0
+
+        # Expiry: 2x halflife = signal decays to 25% strength, considered stale.
+        date_dt = msg.get("date")
+        expires_at = None
+        if date_dt is not None:
+            try:
+                from datetime import timedelta
+                expires_at = (date_dt + timedelta(minutes=int(halflife_min) * 2)).isoformat()
+            except (TypeError, ValueError):
+                pass
+
         return {
             "message_id": msg["message_id"],
             "chat_id": msg["chat_id"],
@@ -319,14 +360,16 @@ class SignalEngine:
             "sender_name": msg.get("sender_name"),
             "text": msg.get("text"),
             "date": msg.get("date"),
-            "direction": factor.get("direction"),
-            "magnitude": factor.get("magnitude"),
-            "urgency": factor.get("urgency"),
-            "confidence": factor.get("confidence"),
-            "halflife_min": factor.get("halflife_min"),
+            "direction": direction,
+            "magnitude": magnitude,
+            "urgency": urgency,
+            "confidence": confidence,
+            "halflife_min": halflife_min,
             "symbols": symbols,
             "event_type": factor.get("event_type"),
             "reasoning": factor.get("reasoning"),
+            "signal_score": signal_score,
+            "expires_at": expires_at,
         }
 
     def process_new_message(self, msg: dict) -> dict | None:
@@ -359,15 +402,26 @@ class SignalEngine:
             if factor.get("is_signal"):
                 from tgwatcher.web.api import push_sse_event
                 payload = self._build_signal_payload(msg, factor)
-                push_sse_event("new_signal", payload)
-                if self._webhook and self._webhook.enabled:
-                    try:
-                        self._webhook.dispatch(payload)
-                    except Exception as wh_err:
-                        logger.warning(
-                            "Webhook dispatch failed for msg %d: %s",
-                            msg["message_id"], wh_err,
-                        )
+
+                # Dedup: same (symbols, direction_sign, event_type) within
+                # window_seconds. Only filters new_signal SSE + webhook dispatch.
+                # signal_factor SSE (debugging) above is unaffected. DB writes
+                # via save_signal_factor already happened in process_message.
+                if self._deduper and not self._deduper.should_emit(payload):
+                    logger.debug(
+                        "Signal deduplicated (not pushed downstream): msg %d",
+                        msg["message_id"],
+                    )
+                else:
+                    push_sse_event("new_signal", payload)
+                    if self._webhook and self._webhook.enabled:
+                        try:
+                            self._webhook.dispatch(payload)
+                        except Exception as wh_err:
+                            logger.warning(
+                                "Webhook dispatch failed for msg %d: %s",
+                                msg["message_id"], wh_err,
+                            )
 
             return factor
         except Exception as e:
