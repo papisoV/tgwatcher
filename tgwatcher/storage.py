@@ -637,11 +637,17 @@ class Storage:
         """
         horizon = outcome.get("time_horizon_min")
         with self.get_session() as session:
-            existing = session.query(SignalOutcome).filter(
+            q = session.query(SignalOutcome).filter(
                 SignalOutcome.message_id == outcome["message_id"],
                 SignalOutcome.chat_id == outcome["chat_id"],
-                SignalOutcome.time_horizon_min == horizon,
-            ).first() if horizon is not None else None
+            )
+            if horizon is None:
+                # NULL horizon is a singleton per (message_id, chat_id);
+                # SQLite treats NULLs as distinct in UNIQUE constraints, so
+                # filter explicitly to maintain upsert semantics.
+                existing = q.filter(SignalOutcome.time_horizon_min.is_(None)).first()
+            else:
+                existing = q.filter(SignalOutcome.time_horizon_min == horizon).first()
             if existing:
                 for key, value in outcome.items():
                     if hasattr(existing, key):

@@ -1469,6 +1469,10 @@ def record_signal_outcome(message_id: int):
     }
     try:
         saved = _storage.save_signal_outcome(outcome)
+        # Serialize datetimes so jsonify doesn't choke on raw datetime objects.
+        for k, v in list(saved.items()):
+            if hasattr(v, "isoformat"):
+                saved[k] = v.isoformat()
         return jsonify({"status": "recorded", "outcome": saved})
     except Exception as e:
         logger.error("save_signal_outcome failed: %s", e, exc_info=True)

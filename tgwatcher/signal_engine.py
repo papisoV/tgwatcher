@@ -202,6 +202,11 @@ class SignalEngine:
                     failed += 1
                     errors.append(f"msg {msg['message_id']}: validation failed in batch")
 
+                # Activate is_signal flag consistently with process_message path.
+                # Without this, batch-processed rows keep the column's default (True)
+                # even when direction=0 or confidence<0.3, breaking downstream filters.
+                factor_data["is_signal"] = self._compute_is_signal(factor_data)
+
                 self._storage.save_signal_factor(factor_data)
 
             # Progress callback after each chunk
@@ -263,6 +268,7 @@ class SignalEngine:
                     "matched_keywords": json.dumps(filter_result.matched_keywords, ensure_ascii=False),
                     "keyword_preliminary": json.dumps(filter_result.preliminary_factors, ensure_ascii=False),
                     "factor_version": self._factor_version,
+                    "is_signal": False,
                 })
                 result.skipped += 1
             else:
