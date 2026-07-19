@@ -258,13 +258,20 @@ def _start_listener_thread(listen_groups: list[dict]) -> bool:
             logger.error("Listener: no async loop available")
             return False
 
-        # Create the Event on the shared loop (must be created from that loop's thread
-        # or via run_coroutine_threadsafe; creating from another thread binds to the
-        # wrong loop). We'll create it inside the coroutine instead.
+        # Synchronously ensure TGClient is connected (holds _tg_lock via guard).
+        # Done outside the _async_loop to avoid racing with other loop coroutines
+        # and to prevent "database is locked" on telethon's SQLite session.
+        try:
+            with _tg_client_guard() as _tg:
+                pass  # connect only; tg is yielded but unused here
+        except Exception as e:
+            logger.error("Listener: TGClient connect failed: %s", e, exc_info=True)
+            push_sse_event("listener_status", {"enabled": False, "error": f"connect failed: {e}"})
+            return False
 
         async def _runner():
             global _listener_stop_event
-            # Create stop_event FIRST so _stop_listener() can signal even during connect
+            # Create stop_event FIRST so _stop_listener() can signal even during listener startup
             _listener_stop_event = asyncio.Event()
             try:
                 await _run_listener_async(listen_groups)
@@ -284,27 +291,16 @@ def _start_listener_thread(listen_groups: list[dict]) -> bool:
 
 
 async def _run_listener_async(listen_groups: list[dict]) -> None:
-    """Run start_listener on the shared TGClient. Stops when _listener_stop_event is set."""
+    """Run start_listener on the shared TGClient. Stops when _listener_stop_event is set.
+
+    Pre-condition: TGClient must be connected before this is called (via _tg_client_guard
+    in the caller thread) to avoid racing with other telethon session writers."""
     global _listener_running
     from tgwatcher.listener import start_listener
     tg = _get_tg_client()
-    logger.info("Listener: _run_listener_async started, stop_event=%s", _listener_stop_event)
-    # Connect if needed (shared with crawl_service). Race against stop_event so a
-    # stop request during connect() still terminates the listener.
     if tg.client is None or not tg.client.is_connected():
-        logger.info("Listener: connecting shared TGClient (racing stop_event)...")
-        connect_task = asyncio.create_task(tg.connect())
-        stop_task = asyncio.create_task(_listener_stop_event.wait())
-        done, pending = await asyncio.wait({connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
-        if stop_task in done:
-            logger.info("Listener: stop requested during connect, aborting")
-            return
-        exc = connect_task.exception()
-        if exc:
-            raise exc
-        logger.info("Listener: connect completed")
+        logger.error("Listener: TGClient not connected on entry; caller must connect first")
+        return
     try:
         await start_listener(
             tg, _storage, listen_groups,
