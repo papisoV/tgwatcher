@@ -42,6 +42,7 @@ PROVIDER_PROTOCOLS = {
     "moonshot": "openai",
     "zhipu": "openai",
     "ollama": "openai",
+    "astron": "openai",
     "anthropic": "anthropic",
 }
 

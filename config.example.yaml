@@ -30,7 +30,7 @@ signal:
   enabled: false
   llm:
     # Active provider — must match a key in `providers` below.
-    # Supported: deepseek | openai | anthropic | openrouter | moonshot | zhipu | ollama
+    # Supported: deepseek | openai | anthropic | openrouter | moonshot | zhipu | ollama | astron
     provider: deepseek
     # All provider credentials. Only the active one (selected by `provider`)
     # is used at runtime; others are ignored but kept here for easy switching.
@@ -60,6 +60,14 @@ signal:
         model: anthropic/claude-sonnet-4.5
         temperature: 0
         max_tokens: 1024
+      astron:
+        # OpenAI-protocol proxy example (astron-code-latest)
+        # api_key format: "key_id:key_secret" (colon-separated)
+        api_key: ''
+        base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+        model: astron-code-latest
+        temperature: 0
+        max_tokens: 512
     timeout_connect: 30
     timeout_read: 60
     timeout_write: 30
