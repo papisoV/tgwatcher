@@ -485,6 +485,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
     <span class="crawl-bar__counts" id="crawlBarCounts"></span>
     <span class="crawl-bar__meta" id="crawlBarMeta"></span>
     <span class="crawl-bar__meta" id="autoPollNext" style="color:var(--cyan);display:none"></span>
+    <span class="crawl-bar__meta" id="listenerBadge" style="color:var(--text-2);display:none"></span>
     <div class="crawl-bar__progress" id="crawlBarProgress" style="width:0%"></div>
   </div>
   <!-- CRAWL DETAIL PANEL -->
@@ -634,7 +635,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
           <table class="data-table">
             <thead><tr>
               <th>名称</th><th style="width:80px">类型</th><th style="width:70px">成员</th>
-              <th style="width:80px">消息数</th><th style="width:140px">最后活跃</th><th style="width:80px">自动补爬</th><th style="width:70px">操作</th>
+              <th style="width:80px">消息数</th><th style="width:140px">最后活跃</th><th style="width:80px">自动补爬</th><th style="width:80px">实时监听</th><th style="width:70px">操作</th>
             </tr></thead>
             <tbody id="groupsBody"></tbody>
           </table>
@@ -645,6 +646,6 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
   </div>
 </div>
 
-<script src="/static/app.js?v=7"></script>
+<script src="/static/app.js?v=8"></script>
 </body>
 </html>

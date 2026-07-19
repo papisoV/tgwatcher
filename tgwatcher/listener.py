@@ -14,13 +14,20 @@ from tgwatcher.storage import Storage
 logger = logging.getLogger(__name__)
 
 
-async def start_listener(client: "TGClient", storage: Storage, groups: list[dict], on_new_message=None, signal_engine=None) -> None:
+async def start_listener(client: "TGClient", storage: Storage, groups: list[dict],
+                         on_new_message=None, signal_engine=None,
+                         stop_event: asyncio.Event | None = None) -> None:
     """Listen for new messages in real-time and save to DB.
 
     Args:
         on_new_message: Optional callback invoked with msg dict after saving.
                         Used to push real-time updates via SSE.
         signal_engine: Optional SignalEngine for real-time factor extraction.
+        stop_event: Optional asyncio.Event. If provided, the listener registers
+                    handlers and awaits stop_event.wait() instead of
+                    run_until_disconnected(). Setting the event stops the
+                    listener without disconnecting the client — lets other
+                    coroutines (e.g. crawl_service) keep using the client.
     """
     tg = client.client
     if tg is None:
@@ -84,4 +91,15 @@ async def start_listener(client: "TGClient", storage: Storage, groups: list[dict
         logger.info("[DEL] %d messages in chat %d", len(event.messages), chat_id)
 
     logger.info("Real-time listener started for %d chats", len(chat_ids))
-    await tg.run_until_disconnected()
+    if stop_event is not None:
+        await stop_event.wait()
+        # Remove handlers so a subsequent listener start doesn't double-register
+        try:
+            tg.remove_event_handler(handler)
+            tg.remove_event_handler(edit_handler)
+            tg.remove_event_handler(delete_handler)
+        except Exception:
+            pass
+        logger.info("Real-time listener stopped via stop_event")
+    else:
+        await tg.run_until_disconnected()

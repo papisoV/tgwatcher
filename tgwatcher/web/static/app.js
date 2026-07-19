@@ -526,6 +526,7 @@ async function loadGroupsView(){
   const chats=await api('/api/chats');if(!chats)return;
   document.getElementById('groupsBody').innerHTML=chats.map(c=>{
     const checked=c.auto_catchup?'checked':'';
+    const listenChecked=c.auto_listen?'checked':'';
     return `<tr>
     <td style="font-weight:500">${esc(c.chat_title||'ID:'+c.chat_id)}</td>
     <td style="font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-2)">${c.chat_type==='channel'?'频道':c.chat_type||'-'}</td>
@@ -533,6 +534,7 @@ async function loadGroupsView(){
     <td class="col-num">${c.msg_count}</td>
     <td class="col-time">${fmtTime(c.last_msg_date)}</td>
     <td><label class="toggle-switch"><input type="checkbox" ${checked} onchange="toggleAutoCatchup(${c.chat_id},this.checked)"><span class="toggle-slider"></span></label></td>
+    <td><label class="toggle-switch"><input type="checkbox" ${listenChecked} onchange="toggleAutoListen(${c.chat_id},this.checked)"><span class="toggle-slider"></span></label></td>
     <td><button class="btn btn-danger" style="font-size:var(--fs-xs);padding:1px 6px" onclick="removeGroup(${c.chat_id})">✕</button></td>
   </tr>`}).join('');
 }
@@ -541,6 +543,16 @@ async function toggleAutoCatchup(chatId,enabled){
   const r=await api('/api/config/groups/'+chatId+'/auto_catchup',{method:'PATCH',body:JSON.stringify({auto_catchup:enabled})});
   if(!r||r.error){showToast(r?.error||'更新失败','error');loadGroupsView()}
   else showToast(enabled?'已启用自动补爬':'已关闭自动补爬','success');
+}
+
+async function toggleAutoListen(chatId,enabled){
+  const r=await api('/api/config/groups/'+chatId+'/auto_listen',{method:'PATCH',body:JSON.stringify({auto_listen:enabled})});
+  if(!r||r.error){showToast(r?.error||'更新失败','error');loadGroupsView();return}
+  if(enabled){
+    showToast(r.listener_running?'已启用实时监听（listener 已在运行）':'已启用实时监听，listener 启动中...','success');
+  }else{
+    showToast('已关闭实时监听','success');
+  }
 }
 
 // ===== PURGE =====
@@ -728,7 +740,8 @@ function connectSSE(){
   es.addEventListener('crawl_error',e=>{showToast(e.data,'error')});
   es.addEventListener('signal_process_status',e=>{checkSignalStatus()});
   es.addEventListener('auto_poll_tick',e=>{try{const d=JSON.parse(e.data);refreshAutoPollUI()}catch(_){}});
-  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState()};
+  es.addEventListener('listener_status',e=>{try{const d=JSON.parse(e.data);refreshListenerBadge(d)}catch(_){}});
+  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState();loadListenState()};
   es.onerror=()=>{sseConnected=false;es.close();if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);setTimeout(connectSSE,10000)};
 }
 
@@ -748,6 +761,26 @@ function refreshAutoPollUI(){
   el.style.display='inline';
   const sec=Math.max(0,Math.floor(next.remaining_seconds||0));
   el.textContent='⟳ '+next.name+' '+sec+'s';
+}
+
+let listenerState={enabled:false,groups:[]};
+function refreshListenerBadge(d){
+  if(d)listenerState=d;
+  const el=document.getElementById('listenerBadge');if(!el)return;
+  if(listenerState.enabled){
+    const names=listenerState.groups||[];
+    el.style.display='inline';
+    el.style.color='var(--green)';
+    el.textContent='● 实时监听 '+(names.length?names.map(g=>g.name||g).join(', '):'');
+  }else{
+    el.style.display='inline';
+    el.style.color='var(--text-2)';
+    el.textContent='○ 实时监听 关';
+  }
+}
+async function loadListenState(){
+  const r=await api('/api/listen/status');if(!r)return;
+  listenerState=r;refreshListenerBadge();
 }
 
 async function openAutoPollModal(){

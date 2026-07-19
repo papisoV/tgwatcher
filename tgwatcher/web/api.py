@@ -34,6 +34,12 @@ _auth_token: str | None = None
 _tg_client: TGClient | None = None
 _tg_lock = threading.Lock()
 
+# Listener state (real-time Telethon NewMessage/Edited/Deleted)
+_listener_thread: threading.Thread | None = None
+_listener_stop_event: "asyncio.Event | None" = None
+_listener_running: bool = False
+_listener_lock = threading.Lock()
+
 # SSE event bus
 _sse_listeners: list[threading.Event] = []
 _sse_events: list[dict] = []
@@ -156,6 +162,9 @@ def init_services(config, async_loop=None) -> None:
     _init_auto_poll(config)
     threading.Thread(target=_auto_poll_loop, daemon=True, name="auto-poll").start()
 
+    # Real-time listener — per-group Telethon NewMessage handler
+    _init_listener(config)
+
 
 # ── Auto-poll state ─────────────────────────────────────────────────────
 _auto_poll_state: dict[int, dict] = {}  # {chat_id: {enabled, interval, next_tick_at, name}}
@@ -218,6 +227,112 @@ def _auto_poll_loop() -> None:
             })
         except Exception as e:
             logger.warning("Auto-poll loop error: %s", e)
+
+
+# ── Real-time listener state ─────────────────────────────────────────────
+def _get_listen_groups(config: dict) -> list[dict]:
+    """Return groups with auto_listen=true."""
+    return [g for g in config.get("groups", []) if g.get("auto_listen", False)]
+
+
+def _init_listener(config: dict) -> None:
+    """Start the real-time listener if any group has auto_listen=true. Called from init_services."""
+    listen_groups = _get_listen_groups(config)
+    if not listen_groups:
+        logger.info("Listener: no groups with auto_listen=true, skipping startup")
+        return
+    _start_listener_thread(listen_groups)
+
+
+def _start_listener_thread(listen_groups: list[dict]) -> bool:
+    """Schedule start_listener on the shared _async_loop. Returns False if already running.
+    The listener coroutine runs on the _async_loop thread (same loop as crawl_service),
+    so it shares the TGClient and event loop without conflict."""
+    global _listener_thread, _listener_stop_event, _listener_running
+    with _listener_lock:
+        if _listener_running:
+            logger.warning("Listener: already running, ignoring start request")
+            return False
+        loop = _async_loop.get_loop() if _async_loop else None
+        if loop is None:
+            logger.error("Listener: no async loop available")
+            return False
+
+        # Create the Event on the shared loop (must be created from that loop's thread
+        # or via run_coroutine_threadsafe; creating from another thread binds to the
+        # wrong loop). We'll create it inside the coroutine instead.
+
+        async def _runner():
+            global _listener_stop_event
+            # Create stop_event FIRST so _stop_listener() can signal even during connect
+            _listener_stop_event = asyncio.Event()
+            try:
+                await _run_listener_async(listen_groups)
+            except Exception as e:
+                logger.error("Listener coroutine crashed: %s", e, exc_info=True)
+                with _listener_lock:
+                    _listener_running = False
+                push_sse_event("listener_status", {"enabled": False, "error": str(e)})
+
+        # Schedule the coroutine on the shared _async_loop thread
+        asyncio.run_coroutine_threadsafe(_runner(), loop)
+        _listener_running = True
+        # _listener_thread stays None — we don't own a thread; runs on _async_loop thread
+        logger.info("Listener coroutine scheduled for %d groups", len(listen_groups))
+        push_sse_event("listener_status", {"enabled": True, "groups": [g.get("name", g.get("id")) for g in listen_groups]})
+        return True
+
+
+async def _run_listener_async(listen_groups: list[dict]) -> None:
+    """Run start_listener on the shared TGClient. Stops when _listener_stop_event is set."""
+    global _listener_running
+    from tgwatcher.listener import start_listener
+    tg = _get_tg_client()
+    logger.info("Listener: _run_listener_async started, stop_event=%s", _listener_stop_event)
+    # Connect if needed (shared with crawl_service). Race against stop_event so a
+    # stop request during connect() still terminates the listener.
+    if tg.client is None or not tg.client.is_connected():
+        logger.info("Listener: connecting shared TGClient (racing stop_event)...")
+        connect_task = asyncio.create_task(tg.connect())
+        stop_task = asyncio.create_task(_listener_stop_event.wait())
+        done, pending = await asyncio.wait({connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        if stop_task in done:
+            logger.info("Listener: stop requested during connect, aborting")
+            return
+        exc = connect_task.exception()
+        if exc:
+            raise exc
+        logger.info("Listener: connect completed")
+    try:
+        await start_listener(
+            tg, _storage, listen_groups,
+            on_new_message=push_new_message,
+            signal_engine=_signal_engine,
+            stop_event=_listener_stop_event,
+        )
+    finally:
+        with _listener_lock:
+            _listener_running = False
+        logger.info("Listener thread exiting")
+        push_sse_event("listener_status", {"enabled": False})
+        push_sse_event("listener_status", {"enabled": False})
+
+
+def _stop_listener() -> bool:
+    """Signal the listener to stop. Returns True if signal was sent.
+    The runner's _run_listener_async races connect against stop_event.wait(),
+    so stop during connect phase still aborts."""
+    global _listener_stop_event
+    with _listener_lock:
+        if not _listener_running or _listener_stop_event is None:
+            return False
+        loop = _async_loop.get_loop() if _async_loop else None
+        if loop is None:
+            return False
+        loop.call_soon_threadsafe(_listener_stop_event.set)
+        return True
 
 
 def _init_signal_engine(config: dict) -> None:
@@ -396,10 +511,12 @@ def get_messages():
 @require_auth
 def get_chats():
     chats = _storage.get_chats()
-    # Merge auto_catchup flag from config
-    group_map = {g.get("id"): g.get("auto_catchup", False) for g in _config.get("groups", [])}
+    # Merge auto_catchup and auto_listen flags from config
+    group_map = {g.get("id"): g for g in _config.get("groups", [])}
     for c in chats:
-        c["auto_catchup"] = group_map.get(c["chat_id"], False)
+        g = group_map.get(c["chat_id"], {})
+        c["auto_catchup"] = g.get("auto_catchup", False)
+        c["auto_listen"] = g.get("auto_listen", False)
     return jsonify(chats)
 
 
@@ -887,12 +1004,16 @@ def update_groups():
     for g in data["groups"]:
         if not g.get("id") and not g.get("username"):
             return jsonify({"error": "Each group must have 'id' or 'username'"}), 400
-    # Preserve auto_catchup flags from existing config for groups that still exist
-    existing_map = {g.get("id"): g.get("auto_catchup", False) for g in _config.get("groups", [])}
+    # Preserve per-group flags from existing config for groups that still exist
+    existing_map = {g.get("id"): g for g in _config.get("groups", [])}
     for g in data["groups"]:
         gid = g.get("id")
         if gid in existing_map:
-            g.setdefault("auto_catchup", existing_map[gid])
+            ex = existing_map[gid]
+            g.setdefault("auto_catchup", ex.get("auto_catchup", False))
+            g.setdefault("auto_poll", ex.get("auto_poll", False))
+            g.setdefault("poll_interval_seconds", ex.get("poll_interval_seconds", 15))
+            g.setdefault("auto_listen", ex.get("auto_listen", False))
     _config["groups"] = data["groups"]
     config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
     _atomic_write_config(_config, config_path)
@@ -918,6 +1039,77 @@ def toggle_group_auto_catchup(chat_id):
     config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
     _atomic_write_config(_config, config_path)
     return jsonify({"status": "updated", "chat_id": chat_id, "auto_catchup": bool(auto_catchup)})
+
+
+@api.route("/config/groups/<int:chat_id>/auto_listen", methods=["PATCH"])
+@require_auth
+def toggle_group_auto_listen(chat_id: int):
+    """Toggle per-group auto_listen. If turning on and listener not running, start it.
+    If turning off and no groups remain, stop the listener."""
+    data = request.get_json(silent=True) or {}
+    auto_listen = data.get("auto_listen")
+    if auto_listen is None:
+        return jsonify({"error": "Missing 'auto_listen' in body"}), 400
+    groups = _config.get("groups", [])
+    found = False
+    for g in groups:
+        if g.get("id") == chat_id:
+            g["auto_listen"] = bool(auto_listen)
+            found = True
+            break
+    if not found:
+        return jsonify({"error": "Group not found in config"}), 404
+    config_path = os.environ.get("TGWATCHER_CONFIG", str(Path.cwd() / "config.yaml"))
+    _atomic_write_config(_config, config_path)
+
+    # Side-effect: start/stop listener based on remaining auto_listen groups
+    listen_groups = _get_listen_groups(_config)
+    if auto_listen and not _listener_running and listen_groups:
+        _start_listener_thread(listen_groups)
+    elif not auto_listen and not listen_groups and _listener_running:
+        _stop_listener()
+
+    return jsonify({"status": "updated", "chat_id": chat_id,
+                    "auto_listen": bool(auto_listen),
+                    "listener_running": _listener_running})
+
+
+@api.route("/listen/status", methods=["GET"])
+@require_auth
+def get_listen_status():
+    """Return current listener state: enabled (running), groups being listened to."""
+    listen_groups = _get_listen_groups(_config)
+    return jsonify({
+        "enabled": _listener_running,
+        "groups": [{"chat_id": g.get("id"), "name": g.get("name", g.get("id"))} for g in listen_groups],
+    })
+
+
+@api.route("/listen/status", methods=["PATCH"])
+@require_auth
+def patch_listen_status():
+    """Start or stop the listener manually.
+    Body: {"enabled": true/false}. When starting, uses all groups with auto_listen=true.
+    If no groups have auto_listen=true, returns 400."""
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    if enabled is None:
+        return jsonify({"error": "Missing 'enabled' in body"}), 400
+    if enabled:
+        listen_groups = _get_listen_groups(_config)
+        if not listen_groups:
+            return jsonify({"error": "No groups with auto_listen=true. Enable auto_listen on at least one group first."}), 400
+        if _listener_running:
+            return jsonify({"status": "already_running", "groups": [g.get("name") for g in listen_groups]})
+        ok = _start_listener_thread(listen_groups)
+        if not ok:
+            return jsonify({"error": "Failed to start listener (check logs)"}), 500
+        return jsonify({"status": "started", "groups": [g.get("name") for g in listen_groups]})
+    else:
+        if not _listener_running:
+            return jsonify({"status": "already_stopped"})
+        _stop_listener()
+        return jsonify({"status": "stopping"})
 
 
 # --- Telegram Dialog API ---
