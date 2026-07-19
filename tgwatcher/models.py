@@ -103,3 +103,27 @@ Index("ix_signal_factors_message_id", SignalFactor.message_id)
 Index("ix_signal_factors_chat_id", SignalFactor.chat_id)
 Index("ix_signal_factors_llm_status", SignalFactor.llm_status)
 Index("ix_signal_factors_event_type", SignalFactor.event_type)
+
+
+class SignalOutcome(Base):
+    """Outcome reported by a downstream consumer after consuming a signal.
+
+    Soft-linked to signal_factors via (message_id, chat_id) — no FK, so
+    outcomes survive even if the source signal row is deleted.
+    """
+    __tablename__ = "signal_outcomes"
+    __table_args__ = (
+        UniqueConstraint("message_id", "chat_id", "time_horizon_min", name="uq_outcome_msg_chat_horizon"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    reported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+    actual_direction: Mapped[int | None] = mapped_column(Integer)          # -1 / 0 / +1 (downstream verdict)
+    magnitude_pct: Mapped[float | None] = mapped_column(Float)             # actual price move %
+    time_horizon_min: Mapped[int | None] = mapped_column(Integer)          # feedback window (15/60/240...)
+    price_t0: Mapped[float | None] = mapped_column(Float)                  # price at signal time
+    price_tn: Mapped[float | None] = mapped_column(Float)                  # price at T+N
+    note: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str | None] = mapped_column(String(64))                 # which downstream system reported

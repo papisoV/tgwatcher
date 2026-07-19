@@ -784,7 +784,9 @@ function connectSSE(){
   es.addEventListener('signal_process_status',e=>{checkSignalStatus()});
   es.addEventListener('auto_poll_tick',e=>{try{const d=JSON.parse(e.data);refreshAutoPollUI()}catch(_){}});
   es.addEventListener('listener_status',e=>{try{const d=JSON.parse(e.data);refreshListenerBadge(d)}catch(_){}});
-  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState();loadListenState()};
+  es.addEventListener('new_signal',e=>{try{const d=JSON.parse(e.data);flashNewSignal(d)}catch(_){}});
+  es.addEventListener('webhook_status',e=>{try{const d=JSON.parse(e.data);refreshWebhookBadge(d)}catch(_){}});
+  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState();loadListenState();loadWebhookState()};
   es.onerror=()=>{sseConnected=false;es.close();if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);setTimeout(connectSSE,10000)};
 }
 
@@ -824,6 +826,54 @@ function refreshListenerBadge(d){
 async function loadListenState(){
   const r=await api('/api/listen/status');if(!r)return;
   listenerState=r;refreshListenerBadge();
+}
+
+// ===== WEBHOOK + NEW_SIGNAL =====
+let webhookState={enabled:false,endpoints:[]};
+function refreshWebhookBadge(d){
+  if(d&&d.url){
+    // Failure event from SSE
+    const el=document.getElementById('webhookBadge');if(!el)return;
+    el.style.display='inline';
+    el.style.color='var(--red)';
+    el.textContent='✗ Webhook '+d.url+' 失败 x'+(d.fail_count||1);
+    return;
+  }
+  const el=document.getElementById('webhookBadge');if(!el)return;
+  if(webhookState.enabled){
+    el.style.display='inline';
+    el.style.color='var(--cyan)';
+    const ok=(webhookState.endpoints||[]).filter(e=>e.enabled).length;
+    el.textContent='↪ Webhook '+ok+' 端点';
+  }else{
+    el.style.display='none';
+  }
+}
+async function loadWebhookState(){
+  const r=await api('/api/webhook/config');if(!r)return;
+  webhookState=r;refreshWebhookBadge();
+}
+let lastSignalFlash=null;
+function flashNewSignal(d){
+  const el=document.getElementById('newSignalBadge');if(!el)return;
+  const dir=d.direction>0?'▲ 利好':d.direction<0?'▼ 利空':'— 中性';
+  const sym=(d.symbols||[]).slice(0,3).join('/')||'?';
+  el.style.display='inline';
+  el.textContent='⚡ '+dir+' '+sym+' '+(d.confidence?(d.confidence*100).toFixed(0)+'%':'');
+  if(lastSignalFlash)clearTimeout(lastSignalFlash);
+  lastSignalFlash=setTimeout(()=>{el.style.display='none'},8000);
+}
+async function testWebhook(){
+  const r=await api('/api/webhook/test',{method:'POST',body:JSON.stringify({})});
+  if(!r)return;
+  if(r.status==='sent'){
+    const ok=(r.results||[]).filter(x=>x.ok).length;
+    const total=(r.results||[]).length;
+    showToast('测试发送：'+ok+'/'+total+' 端点成功',ok===total?'success':'error');
+  }else{
+    showToast('无可用 webhook 端点','error');
+  }
+  loadWebhookState();
 }
 
 async function openAutoPollModal(){

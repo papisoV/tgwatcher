@@ -8,13 +8,13 @@ from sqlalchemy import tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from tgwatcher.models import Base, Chat, Message, Sender, SignalFactor
+from tgwatcher.models import Base, Chat, Message, Sender, SignalFactor, SignalOutcome
 from tgwatcher.schemas import EditUpdate, ParsedChat, ParsedMessage, ParsedSender
 from tgwatcher.tz_utils import utc_now, local_to_utc, sql_tz_shift, tz_offset_hours
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Storage:
@@ -67,6 +67,8 @@ class Storage:
             self._migrate_v4_to_v5()
         if from_version < 6:
             self._migrate_v5_to_v6()
+        if from_version < 7:
+            self._migrate_v6_to_v7()
 
     def _migrate_v1_to_v2(self) -> None:
         logger.info("Migrating schema v1 -> v2 ...")
@@ -151,6 +153,15 @@ class Storage:
             conn.commit()
         self._set_schema_version(6)
         logger.info("Migration v5 -> v6 complete")
+
+    def _migrate_v6_to_v7(self) -> None:
+        """Create signal_outcomes table for downstream feedback."""
+        logger.info("Migrating schema v6 -> v7 (create signal_outcomes table) ...")
+        # Base.metadata.create_all already creates new tables on init_db, but
+        # if the DB pre-existed, we still need to ensure the table exists.
+        Base.metadata.create_all(self.engine, tables=[SignalOutcome.__table__])
+        self._set_schema_version(7)
+        logger.info("Migration v6 -> v7 complete")
 
     def get_session(self) -> Session:
         return self._session_factory()
@@ -618,6 +629,41 @@ class Storage:
             if not sf:
                 return None
         return {c.name: getattr(sf, c.name) for c in sf.__table__.columns}
+
+    def save_signal_outcome(self, outcome: dict) -> dict:
+        """Upsert a signal outcome. Keyed on (message_id, chat_id, time_horizon_min).
+
+        Returns the saved row as a dict.
+        """
+        horizon = outcome.get("time_horizon_min")
+        with self.get_session() as session:
+            existing = session.query(SignalOutcome).filter(
+                SignalOutcome.message_id == outcome["message_id"],
+                SignalOutcome.chat_id == outcome["chat_id"],
+                SignalOutcome.time_horizon_min == horizon,
+            ).first() if horizon is not None else None
+            if existing:
+                for key, value in outcome.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+                # Always refresh reported_at on re-report
+                existing.reported_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                row = existing
+            else:
+                row = SignalOutcome(**outcome)
+                session.add(row)
+            session.commit()
+            session.refresh(row)
+            return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+    def get_signal_outcomes(self, message_id: int, chat_id: int) -> list[dict]:
+        """Return all outcomes reported for a (message_id, chat_id) signal."""
+        with self.get_session() as session:
+            rows = session.query(SignalOutcome).filter(
+                SignalOutcome.message_id == message_id,
+                SignalOutcome.chat_id == chat_id,
+            ).order_by(SignalOutcome.time_horizon_min.asc()).all()
+            return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
 
     def query_signal_factors(self, chat_id: int | None = None,
                              event_type: str | None = None,

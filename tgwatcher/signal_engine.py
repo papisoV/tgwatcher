@@ -24,7 +24,8 @@ class BatchResult:
 
 class SignalEngine:
     def __init__(self, storage: Storage, keyword_filter: KeywordFilter,
-                 llm: SignalLLMClient, config: dict):
+                 llm: SignalLLMClient, config: dict,
+                 webhook_dispatcher=None):
         self._storage = storage
         self._filter = keyword_filter
         self._llm = llm
@@ -33,6 +34,8 @@ class SignalEngine:
         self._llm_delay = config.get("llm_delay", 1.0)
         self._llm_batch_size = config.get("llm_batch_size", 15)
         self._factor_version = config.get("factor_version", 2)
+        # Webhook dispatcher (optional). None = no webhook dispatch.
+        self._webhook = webhook_dispatcher
 
     def process_message(self, msg: dict) -> dict | None:
         """Process a single message through keyword filter and LLM. Returns factor dict or None."""
@@ -57,6 +60,7 @@ class SignalEngine:
                 "matched_keywords": json.dumps(filter_result.matched_keywords, ensure_ascii=False),
                 "keyword_preliminary": json.dumps(filter_result.preliminary_factors, ensure_ascii=False),
                 "factor_version": self._factor_version,
+                "is_signal": False,
             }
             self._storage.save_signal_factor(factor_data)
             return factor_data
@@ -96,8 +100,26 @@ class SignalEngine:
                 "llm_error": str(e)[:256],
             })
 
+        # Activate the is_signal flag: only "non-neutral + confidence>=0.3 + completed".
+        # Before this change, the column defaulted to True for every saved row, which
+        # made it useless as a downstream filter. Now it carries real semantics.
+        factor_data["is_signal"] = self._compute_is_signal(factor_data)
+
         self._storage.save_signal_factor(factor_data)
         return factor_data
+
+    @staticmethod
+    def _compute_is_signal(factor_data: dict) -> bool:
+        """A factor is a 'signal' if LLM completed, direction is non-zero, and
+        confidence is at least 0.3. Used by webhook + new_signal SSE filters."""
+        if factor_data.get("llm_status") != "completed":
+            return False
+        try:
+            direction = float(factor_data.get("direction") or 0)
+            confidence = float(factor_data.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return False
+        return direction != 0 and confidence >= 0.3
 
     def _process_batch_llm(
         self,
@@ -277,15 +299,46 @@ class SignalEngine:
                      result.completed, result.failed, result.skipped, result.total)
         return result
 
+    @staticmethod
+    def _build_signal_payload(msg: dict, factor: dict) -> dict:
+        """Build the new_signal payload — mirrors /api/signals/export JSON row shape."""
+        try:
+            symbols = json.loads(factor["symbols"]) if factor.get("symbols") else []
+        except (json.JSONDecodeError, TypeError):
+            symbols = []
+        return {
+            "message_id": msg["message_id"],
+            "chat_id": msg["chat_id"],
+            "chat_title": msg.get("chat_title"),
+            "sender_name": msg.get("sender_name"),
+            "text": msg.get("text"),
+            "date": msg.get("date"),
+            "direction": factor.get("direction"),
+            "magnitude": factor.get("magnitude"),
+            "urgency": factor.get("urgency"),
+            "confidence": factor.get("confidence"),
+            "halflife_min": factor.get("halflife_min"),
+            "symbols": symbols,
+            "event_type": factor.get("event_type"),
+            "reasoning": factor.get("reasoning"),
+        }
+
     def process_new_message(self, msg: dict) -> dict | None:
         """Process a new message from the listener. Wraps LLM call with timeout.
         On failure, sets llm_status='pending' so batch processor can retry later.
         Pushes SSE event on completion.
+
+        - `signal_factor` SSE: fires on every completed/skipped (existing behavior).
+        - `new_signal` SSE: fires only when is_signal=True (downstream-facing).
+        - webhook dispatch: same trigger condition as `new_signal` SSE.
         """
         try:
             factor = self.process_message(msg)
-            # Push SSE event (import here to avoid circular imports)
-            if factor and factor.get("llm_status") in ("completed", "skipped"):
+            if not factor:
+                return None
+
+            # Always push the per-factor SSE (debugging, includes skipped)
+            if factor.get("llm_status") in ("completed", "skipped"):
                 from tgwatcher.web.api import push_sse_event
                 push_sse_event("signal_factor", {
                     "message_id": msg["message_id"],
@@ -295,6 +348,21 @@ class SignalEngine:
                     "magnitude": factor.get("magnitude"),
                     "urgency": factor.get("urgency"),
                 })
+
+            # Downstream-facing new_signal + webhook — only for real signals.
+            if factor.get("is_signal"):
+                from tgwatcher.web.api import push_sse_event
+                payload = self._build_signal_payload(msg, factor)
+                push_sse_event("new_signal", payload)
+                if self._webhook and self._webhook.enabled:
+                    try:
+                        self._webhook.dispatch(payload)
+                    except Exception as wh_err:
+                        logger.warning(
+                            "Webhook dispatch failed for msg %d: %s",
+                            msg["message_id"], wh_err,
+                        )
+
             return factor
         except Exception as e:
             logger.error("process_new_message failed for msg %d: %s", msg.get("message_id"), e)

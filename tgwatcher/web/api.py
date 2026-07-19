@@ -51,6 +51,7 @@ _rate_limit_store: dict[str, list[float]] = {}
 
 _signal_service: SignalService | None = None
 _signal_engine: SignalEngine | None = None
+_webhook_dispatcher = None
 
 MAX_SSE_EVENTS = 200
 
@@ -122,7 +123,7 @@ def require_auth(f):
 
 
 def init_services(config, async_loop=None) -> None:
-    global _storage, _crawl_service, _config, _async_loop, _signal_service, _signal_engine
+    global _storage, _crawl_service, _config, _async_loop, _signal_service, _signal_engine, _webhook_dispatcher
     _config = config
     _async_loop = async_loop
     db_path = config["storage"]["db_path"]
@@ -145,6 +146,11 @@ def init_services(config, async_loop=None) -> None:
     else:
         _signal_service = None
         _signal_engine = None
+
+    # Webhook dispatcher — initialized independently of signal engine so
+    # downstream-facing output works even if LLM api_key is missing.
+    from tgwatcher.webhook import WebhookDispatcher
+    _webhook_dispatcher = WebhookDispatcher(config)
 
     # Auto-catchup on startup
     catchup_cfg = config.get("catchup", {})
@@ -332,7 +338,11 @@ def _stop_listener() -> bool:
 
 
 def _init_signal_engine(config: dict) -> None:
-    """Initialize signal engine, LLM client, and service. Called from init_services."""
+    """Initialize signal engine, LLM client, and service. Called from init_services.
+
+    Webhook dispatcher is initialized separately in init_services (not gated
+    on signal.enabled or api_key presence).
+    """
     global _signal_service, _signal_engine
     import os
     signal_cfg = config.get("signal", {})
@@ -349,13 +359,18 @@ def _init_signal_engine(config: dict) -> None:
 
     keyword_filter = KeywordFilter(signal_cfg)
     llm_client = SignalLLMClient(llm_cfg)
-    _signal_engine = SignalEngine(_storage, keyword_filter, llm_client, signal_cfg)
+    _signal_engine = SignalEngine(
+        _storage, keyword_filter, llm_client, signal_cfg,
+        webhook_dispatcher=_webhook_dispatcher,
+    )
 
     def _on_signal_status(status: dict):
         push_sse_event("signal_process_status", status)
 
     _signal_service = SignalService(_signal_engine, signal_cfg, on_status_change=_on_signal_status)
-    logger.info("Signal engine initialized (model=%s)", llm_cfg.get("model", "unknown"))
+    logger.info("Signal engine initialized (model=%s, webhook=%s)",
+                llm_cfg.get("model", "unknown"),
+                "enabled" if (_webhook_dispatcher and _webhook_dispatcher.enabled) else "disabled")
 
 
 def push_sse_event(event_type: str, data: dict) -> None:
@@ -1422,3 +1437,81 @@ def signal_reprocess(message_id: int):
     if factor:
         return jsonify(factor)
     return jsonify({"error": "Processing failed"}), 500
+
+
+# ===== Signal outcome feedback (downstream reports actual price action) =====
+
+@api.route("/signals/<int:message_id>/outcome", methods=["POST"])
+@require_auth
+def record_signal_outcome(message_id: int):
+    """Record a downstream-reported outcome for a signal.
+
+    Body may include chat_id; if omitted, falls back to ?chat_id= query param.
+    Required: chat_id. Optional: actual_direction, magnitude_pct, time_horizon_min,
+    price_t0, price_tn, note, source.
+    """
+    if not _storage:
+        return jsonify({"error": "Storage not initialized"}), 500
+    data = request.get_json(silent=True) or {}
+    chat_id = data.get("chat_id") or request.args.get("chat_id", type=int)
+    if not chat_id:
+        return jsonify({"error": "chat_id required (body or query)"}), 400
+    outcome = {
+        "message_id": message_id,
+        "chat_id": int(chat_id),
+        "actual_direction": data.get("actual_direction"),
+        "magnitude_pct": data.get("magnitude_pct"),
+        "time_horizon_min": data.get("time_horizon_min"),
+        "price_t0": data.get("price_t0"),
+        "price_tn": data.get("price_tn"),
+        "note": data.get("note"),
+        "source": data.get("source"),
+    }
+    try:
+        saved = _storage.save_signal_outcome(outcome)
+        return jsonify({"status": "recorded", "outcome": saved})
+    except Exception as e:
+        logger.error("save_signal_outcome failed: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@api.route("/signals/<int:message_id>/outcomes", methods=["GET"])
+@require_auth
+def get_signal_outcomes(message_id: int):
+    """List all outcomes reported for a signal."""
+    if not _storage:
+        return jsonify({"error": "Storage not initialized"}), 500
+    chat_id = request.args.get("chat_id", type=int)
+    if not chat_id:
+        return jsonify({"error": "chat_id required"}), 400
+    outcomes = _storage.get_signal_outcomes(message_id, chat_id)
+    # Serialize datetimes
+    for o in outcomes:
+        for k, v in list(o.items()):
+            if hasattr(v, "isoformat"):
+                o[k] = v.isoformat()
+    return jsonify({"message_id": message_id, "chat_id": chat_id, "outcomes": outcomes})
+
+
+# ===== Webhook management =====
+
+@api.route("/webhook/config", methods=["GET"])
+@require_auth
+def get_webhook_config():
+    """Return current webhook dispatcher status (secrets never exposed)."""
+    if not _webhook_dispatcher:
+        return jsonify({"enabled": False, "endpoints": []})
+    return jsonify(_webhook_dispatcher.get_status())
+
+
+@api.route("/webhook/test", methods=["POST"])
+@require_auth
+def test_webhook():
+    """Send a test payload to all enabled webhook endpoints (or a specific url)."""
+    if not _webhook_dispatcher:
+        return jsonify({"error": "Webhook not initialized"}), 500
+    data = request.get_json(silent=True) or {}
+    target_url = data.get("url")
+    result = _webhook_dispatcher.send_test(target_url)
+    return jsonify(result)
+

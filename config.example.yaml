@@ -137,3 +137,11 @@ signal:
 catchup:
   enabled: true
   limit: 1000
+webhook:
+  enabled: false
+  timeout_seconds: 5
+  max_workers: 4
+  endpoints:
+    - url: http://localhost:9000/signal
+      secret: "your-hmac-secret-here"
+      enabled: false
