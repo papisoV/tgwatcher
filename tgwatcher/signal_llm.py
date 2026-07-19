@@ -1,8 +1,24 @@
 """
 LLM client wrapper for signal factor refinement.
 
-Uses OpenAI SDK with configurable base_url to call DeepSeek-compatible APIs
-for structured JSON response parsing with retry and validation.
+Supports multiple providers via a single active selection:
+- OpenAI-protocol providers (deepseek/openai/openrouter/moonshot/zhipu/ollama):
+  use the `openai` SDK with base_url override.
+- Anthropic-protocol providers (anthropic): use the `anthropic` SDK with
+  base_url override (supports both official and proxy endpoints).
+
+Config schema (new):
+  signal.llm.provider: <name>           # which provider to activate
+  signal.llm.providers:                  # all credentials
+    deepseek: {api_key, base_url, model, temperature, max_tokens}
+    anthropic: {api_key, base_url, model, max_tokens}
+    ...
+
+Legacy schema (deprecated, still works):
+  signal.llm.provider: deepseek
+  signal.llm.base_url / api_key / model / temperature / max_tokens at top level.
+  Logs a deprecation warning; migrate to `providers:` dict.
+
 Schema v2: direction/magnitude/urgency/confidence/halflife_min/symbols.
 """
 
@@ -10,13 +26,31 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+# Provider -> wire protocol. Unknown providers fail-fast at config load.
+PROVIDER_PROTOCOLS = {
+    "openai": "openai",
+    "deepseek": "openai",
+    "openrouter": "openai",
+    "moonshot": "openai",
+    "zhipu": "openai",
+    "ollama": "openai",
+    "anthropic": "anthropic",
+}
+
+# System prompt injected for Anthropic calls to force pure JSON output.
+# OpenAI/DeepSeek use `response_format={"type":"json_object"}` instead.
+ANTHROPIC_JSON_SYSTEM_PROMPT = (
+    "你是一个加密货币消息因子分析器。只输出严格的 JSON，"
+    "不要输出 markdown 代码块、解释或其他任何内容。"
+)
 
 # Valid enum values for validation
 VALID_EVENT_TYPES = [
@@ -109,15 +143,107 @@ class LLMRefineError(Exception):
 
 @dataclass
 class LLMConfig:
-    """Configuration for LLM client."""
+    """Configuration for LLM client.
+
+    Build via `LLMConfig.from_dict(llm_cfg)` rather than constructing directly —
+    the factory handles provider lookup, legacy-config compat, and validation.
+    """
+    provider: str
     base_url: str
+    model: str
     api_key: str | None = None
-    model: str = "deepseek-chat"
+    temperature: float = 0.0
+    max_tokens: int = 512
     timeout_connect: float = 10.0
     timeout_read: float = 30.0
     timeout_write: float = 30.0
     timeout_pool: float = 10.0
     max_retries: int = 3
+    # Full providers dict (kept for future runtime-switching; current code
+    # only uses the active provider resolved at construction time).
+    providers: dict[str, dict] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, llm_cfg: dict) -> "LLMConfig":
+        """Build LLMConfig from signal.llm config dict.
+
+        Resolves the active provider via `llm_cfg['provider']`, then pulls its
+        credentials from `llm_cfg['providers'][provider]`. Falls back to
+        top-level `base_url`/`api_key`/`model` for legacy configs (logs a
+        deprecation warning). Validates provider is known.
+
+        Raises:
+            ValueError: if provider is missing, unknown, or credentials absent.
+        """
+        provider = llm_cfg.get("provider")
+        if not provider:
+            raise ValueError(
+                "signal.llm.provider is required (one of: "
+                f"{sorted(PROVIDER_PROTOCOLS)})"
+            )
+        if provider not in PROVIDER_PROTOCOLS:
+            raise ValueError(
+                f"Unknown LLM provider: {provider!r}. Supported: "
+                f"{sorted(PROVIDER_PROTOCOLS)}"
+            )
+
+        providers = llm_cfg.get("providers") or {}
+        provider_cfg = providers.get(provider, {})
+
+        if provider_cfg:
+            base_url = provider_cfg.get("base_url", "")
+            api_key = provider_cfg.get("api_key", "")
+            model = provider_cfg.get("model", "")
+            temperature = provider_cfg.get("temperature", 0.0)
+            max_tokens = provider_cfg.get("max_tokens", 512)
+        else:
+            # Legacy fallback: top-level fields, no `providers:` dict.
+            logger.warning(
+                "Legacy signal.llm config detected (top-level base_url/api_key/model). "
+                "Migrate to `providers:` dict with provider-keyed credentials. "
+                "See config.example.yaml."
+            )
+            base_url = llm_cfg.get("base_url", "")
+            api_key = llm_cfg.get("api_key", "")
+            model = llm_cfg.get("model", "")
+            temperature = llm_cfg.get("temperature", 0.0)
+            max_tokens = llm_cfg.get("max_tokens", 512)
+
+        if not base_url:
+            raise ValueError(
+                f"signal.llm.providers.{provider}.base_url is required"
+            )
+        if not model:
+            raise ValueError(
+                f"signal.llm.providers.{provider}.model is required"
+            )
+
+        # Env override: ANTHROPIC_API_KEY for anthropic, SIGNAL_LLM_API_KEY for any.
+        env_key = (
+            "ANTHROPIC_API_KEY" if provider == "anthropic"
+            else "SIGNAL_LLM_API_KEY"
+        )
+        api_key = os.environ.get(env_key) or api_key
+        if not api_key:
+            raise ValueError(
+                f"API key required for provider {provider!r}: set {env_key} env "
+                f"or signal.llm.providers.{provider}.api_key"
+            )
+
+        return cls(
+            provider=provider,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            temperature=float(temperature),
+            max_tokens=int(max_tokens),
+            timeout_connect=float(llm_cfg.get("timeout_connect", 10.0)),
+            timeout_read=float(llm_cfg.get("timeout_read", 30.0)),
+            timeout_write=float(llm_cfg.get("timeout_write", 30.0)),
+            timeout_pool=float(llm_cfg.get("timeout_pool", 10.0)),
+            max_retries=int(llm_cfg.get("max_retries", 3)),
+            providers=providers,
+        )
 
 
 class SignalLLMClient:
@@ -125,6 +251,7 @@ class SignalLLMClient:
     LLM client for refining signal factors.
 
     Provides structured JSON output with retry logic and schema validation.
+    Routes to OpenAI or Anthropic SDK based on `config.provider`.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -132,14 +259,21 @@ class SignalLLMClient:
         Initialize the LLM client.
 
         Args:
-            config: LLMConfig with base_url, api_key, model, and timeout settings.
-        """
-        # API key: env override > config value
-        api_key = os.environ.get("SIGNAL_LLM_API_KEY") or config.api_key
-        if not api_key:
-            raise ValueError("API key required: set SIGNAL_LLM_API_KEY env or config.api_key")
+            config: LLMConfig built via LLMConfig.from_dict(llm_cfg). Must have
+                provider/base_url/api_key/model and timeout settings.
 
-        # Build httpx timeout
+        Raises:
+            ValueError: if provider protocol is unknown (should have been
+                caught by LLMConfig.from_dict already, defense-in-depth here).
+        """
+        self._protocol = PROVIDER_PROTOCOLS.get(config.provider)
+        if not self._protocol:
+            raise ValueError(
+                f"Unknown provider: {config.provider!r}. Supported: "
+                f"{sorted(PROVIDER_PROTOCOLS)}"
+            )
+
+        # Build httpx timeout (shared by both SDKs).
         timeout = httpx.Timeout(
             connect=config.timeout_connect,
             read=config.timeout_read,
@@ -147,19 +281,39 @@ class SignalLLMClient:
             pool=config.timeout_pool,
         )
 
-        self._client = OpenAI(
-            base_url=config.base_url,
-            api_key=api_key,
-            timeout=timeout,
-            max_retries=config.max_retries,
-        )
+        if self._protocol == "openai":
+            self._client = OpenAI(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                timeout=timeout,
+                max_retries=config.max_retries,
+            )
+        elif self._protocol == "anthropic":
+            try:
+                from anthropic import Anthropic
+            except ImportError as e:
+                raise ValueError(
+                    "anthropic package not installed. Run: pip install anthropic>=0.40.0"
+                ) from e
+            self._client = Anthropic(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                timeout=timeout,
+                max_retries=config.max_retries,
+            )
+        else:  # Defensive — should be unreachable.
+            raise ValueError(f"Unhandled protocol: {self._protocol}")
+
+        self._provider = config.provider
         self._model = config.model
+        self._temperature = config.temperature
+        self._max_tokens = config.max_tokens
         self._max_retries = config.max_retries
 
         logger.info(
-            "SignalLLMClient initialized: base_url=%s, model=%s",
-            config.base_url,
-            config.model,
+            "SignalLLMClient initialized: provider=%s, protocol=%s, "
+            "base_url=%s, model=%s",
+            config.provider, self._protocol, config.base_url, config.model,
         )
 
     def _format_preliminary_text(self, preliminary_factors: dict[str, Any]) -> str:
@@ -264,6 +418,70 @@ class SignalLLMClient:
 
         return data
 
+    def _call_llm(self, prompt: str) -> str:
+        """Dispatch prompt to the configured provider, return raw text response.
+
+        Routes to `_call_openai` or `_call_anthropic` based on provider protocol.
+        Both paths return the raw model output text; JSON parsing + validation
+        is handled by the caller.
+        """
+        if self._protocol == "openai":
+            return self._call_openai(prompt)
+        elif self._protocol == "anthropic":
+            return self._call_anthropic(prompt)
+        # Defensive — protocol validated in __init__.
+        raise ValueError(f"Unhandled protocol: {self._protocol}")
+
+    def _call_openai(self, prompt: str) -> str:
+        """Call OpenAI-compatible chat completion endpoint.
+
+        Uses `response_format={"type":"json_object"}` for structured output.
+        Works with deepseek/openai/openrouter/moonshot/zhipu/ollama.
+        """
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        usage = response.usage
+        if usage:
+            logger.info(
+                "LLM call completed: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
+            )
+        return response.choices[0].message.content.strip()
+
+    def _call_anthropic(self, prompt: str) -> str:
+        """Call Anthropic Messages API.
+
+        Uses ANTHROPIC_JSON_SYSTEM_PROMPT to force JSON output (Anthropic has no
+        `response_format` field like OpenAI). Works with both official and
+        proxy Anthropic endpoints (base_url set at client construction).
+        """
+        response = self._client.messages.create(
+            model=self._model,
+            system=ANTHROPIC_JSON_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        # Anthropic response shape: response.content is a list of content blocks;
+        # for text response, content[0].text holds the output.
+        if not response.content:
+            raise LLMRefineError("Anthropic returned empty content")
+        raw = response.content[0].text.strip()
+        usage = getattr(response, "usage", None)
+        if usage:
+            in_tok = getattr(usage, "input_tokens", 0)
+            out_tok = getattr(usage, "output_tokens", 0)
+            logger.info(
+                "LLM call completed (anthropic): input_tokens=%d, output_tokens=%d",
+                in_tok, out_tok,
+            )
+        return raw
+
     def refine(self, text: str, preliminary_factors: dict[str, Any]) -> dict[str, Any]:
         """
         Refine message factors using LLM with retry logic.
@@ -287,24 +505,9 @@ class SignalLLMClient:
         # Retry with exponential backoff: 1s, 2s, 4s
         for attempt in range(self._max_retries):
             try:
-                response = self._client.chat.completions.create(
-                    model=self._model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                )
-
-                # Token usage logging
-                usage = response.usage
-                if usage:
-                    logger.info(
-                        "LLM call completed: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        usage.total_tokens,
-                    )
+                raw = self._call_llm(prompt)
 
                 # Defensive JSON parsing: strip markdown code fences
-                raw = response.choices[0].message.content.strip()
                 if raw.startswith("```"):
                     match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
                     if match:
@@ -366,20 +569,9 @@ class SignalLLMClient:
         # Try batch call with retry
         for attempt in range(self._max_retries):
             try:
-                response = self._client.chat.completions.create(
-                    model=self._model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                )
+                raw = self._call_llm(prompt)
 
-                usage = response.usage
-                if usage:
-                    logger.info(
-                        "LLM batch call completed: %d messages, prompt_tokens=%d, completion_tokens=%d",
-                        len(messages), usage.prompt_tokens, usage.completion_tokens,
-                    )
-
-                raw = response.choices[0].message.content.strip()
+                # Defensive JSON parsing: strip markdown code fences
                 if raw.startswith("```"):
                     match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
                     if match:

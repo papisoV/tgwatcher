@@ -348,17 +348,20 @@ def _init_signal_engine(config: dict) -> None:
     signal_cfg = config.get("signal", {})
     llm_cfg = signal_cfg.get("llm", {})
 
-    # API key validation: env overrides config
-    api_key = os.environ.get("SIGNAL_LLM_API_KEY") or llm_cfg.get("api_key", "")
-    if not api_key:
-        logger.warning("Signal enabled but no API key configured. Disabling signal processing.")
+    # Build LLMConfig via factory — handles provider routing, legacy compat,
+    # env override, and validation. Raises ValueError on missing/unknown provider.
+    try:
+        from tgwatcher.signal_llm import LLMConfig
+        llm_config = LLMConfig.from_dict(llm_cfg)
+    except ValueError as e:
+        logger.warning("Signal enabled but LLM config invalid: %s. Disabling signal processing.", e)
         signal_cfg["enabled"] = False
         _signal_service = None
         _signal_engine = None
         return
 
     keyword_filter = KeywordFilter(signal_cfg)
-    llm_client = SignalLLMClient(llm_cfg)
+    llm_client = SignalLLMClient(llm_config)
     _signal_engine = SignalEngine(
         _storage, keyword_filter, llm_client, signal_cfg,
         webhook_dispatcher=_webhook_dispatcher,
@@ -368,9 +371,12 @@ def _init_signal_engine(config: dict) -> None:
         push_sse_event("signal_process_status", status)
 
     _signal_service = SignalService(_signal_engine, signal_cfg, on_status_change=_on_signal_status)
-    logger.info("Signal engine initialized (model=%s, webhook=%s)",
-                llm_cfg.get("model", "unknown"),
-                "enabled" if (_webhook_dispatcher and _webhook_dispatcher.enabled) else "disabled")
+    logger.info(
+        "Signal engine initialized (provider=%s, model=%s, webhook=%s)",
+        llm_config.provider,
+        llm_config.model,
+        "enabled" if (_webhook_dispatcher and _webhook_dispatcher.enabled) else "disabled",
+    )
 
 
 def push_sse_event(event_type: str, data: dict) -> None:

@@ -29,14 +29,45 @@ telegram:
 signal:
   enabled: false
   llm:
+    # Active provider — must match a key in `providers` below.
+    # Supported: deepseek | openai | anthropic | openrouter | moonshot | zhipu | ollama
     provider: deepseek
-    base_url: https://api.deepseek.com/v1
-    model: deepseek-chat
-    api_key: ''
-    temperature: 0
-    max_tokens: 512
+    # All provider credentials. Only the active one (selected by `provider`)
+    # is used at runtime; others are ignored but kept here for easy switching.
+    providers:
+      deepseek:
+        api_key: ''
+        base_url: https://api.deepseek.com/v1
+        model: deepseek-chat
+        temperature: 0
+        max_tokens: 512
+      openai:
+        api_key: ''
+        base_url: https://api.openai.com/v1
+        model: gpt-4o-mini
+        temperature: 0
+        max_tokens: 512
+      anthropic:
+        # Official: https://api.anthropic.com
+        # Proxy example: https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic
+        api_key: ''
+        base_url: https://api.anthropic.com
+        model: claude-sonnet-4-6
+        max_tokens: 1024
+      openrouter:
+        api_key: ''
+        base_url: https://openrouter.ai/api/v1
+        model: anthropic/claude-sonnet-4.5
+        temperature: 0
+        max_tokens: 1024
     timeout_connect: 30
     timeout_read: 60
+    timeout_write: 30
+    timeout_pool: 10
+    max_retries: 3
+    # Env overrides (optional):
+    #   SIGNAL_LLM_API_KEY — overrides active provider's api_key (OpenAI-protocol)
+    #   ANTHROPIC_API_KEY  — overrides anthropic provider's api_key
   filter:
     min_text_length: 10
     pass_if_any_match: true

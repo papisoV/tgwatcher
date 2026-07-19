@@ -90,7 +90,7 @@ class SignalEngine:
                 "event_type": llm_result["event_type"],
                 "reasoning": llm_result.get("reasoning", ""),
                 "llm_status": "completed",
-                "llm_model": self._config.get("llm", {}).get("model", ""),
+                "llm_model": f"{self._config.get('llm', {}).get('provider', 'unknown')}:{self._config.get('llm', {}).get('model', '')}",
                 "llm_raw": json.dumps(llm_result, ensure_ascii=False),
             })
         except (LLMRefineError, Exception) as e:
@@ -190,7 +190,7 @@ class SignalEngine:
                         "event_type": llm_result["event_type"],
                         "reasoning": llm_result.get("reasoning", ""),
                         "llm_status": "completed",
-                        "llm_model": self._config.get("llm", {}).get("model", ""),
+                        "llm_model": f"{self._config.get('llm', {}).get('provider', 'unknown')}:{self._config.get('llm', {}).get('model', '')}",
                         "llm_raw": json.dumps(llm_result, ensure_ascii=False),
                     })
                     completed += 1
