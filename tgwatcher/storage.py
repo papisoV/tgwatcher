@@ -14,7 +14,7 @@ from tgwatcher.tz_utils import utc_now, local_to_utc, sql_tz_shift, tz_offset_ho
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Storage:
@@ -65,6 +65,8 @@ class Storage:
             self._migrate_v3_to_v4()
         if from_version < 5:
             self._migrate_v4_to_v5()
+        if from_version < 6:
+            self._migrate_v5_to_v6()
 
     def _migrate_v1_to_v2(self) -> None:
         logger.info("Migrating schema v1 -> v2 ...")
@@ -135,6 +137,20 @@ class Storage:
         Base.metadata.create_all(self.engine, tables=[SignalFactor.__table__])
         self._set_schema_version(5)
         logger.info("Migration v4 -> v5 complete (old factor data discarded)")
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Add is_signal column to signal_factors table."""
+        logger.info("Migrating schema v5 -> v6 (add is_signal column) ...")
+        with self.engine.connect() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE signal_factors ADD COLUMN is_signal BOOLEAN DEFAULT 1"
+                ))
+            except OperationalError:
+                pass  # Column already exists
+            conn.commit()
+        self._set_schema_version(6)
+        logger.info("Migration v5 -> v6 complete")
 
     def get_session(self) -> Session:
         return self._session_factory()

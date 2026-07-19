@@ -70,6 +70,7 @@ class SignalFactor(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_signal: Mapped[bool] = mapped_column(Boolean, default=True)  # True=signal, False=noise
     # Factor dimensions (float for quantitative weighting)
     direction: Mapped[float | None] = mapped_column(Float)          # [-1.0, 1.0] negative=bearish, positive=bullish
     magnitude: Mapped[float | None] = mapped_column(Float)          # [0.0, 1.0] impact strength

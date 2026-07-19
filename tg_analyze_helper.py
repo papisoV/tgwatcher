@@ -205,6 +205,7 @@ def _preanalyze_message(text: str, msg_id: int, chat_id: int) -> dict:
             "reasoning": f"noise: {noise_reason}" if is_noise else "noise: no signal keywords matched",
             "matched_categories": [],
             "matched_keywords": filter_result.matched_keywords,
+            "llm_model": "rule-engine",
         }
 
     # Signal candidate — build pre-filled factors
@@ -600,9 +601,11 @@ def cmd_write(db_path: str, results_file: str, args: list[str]):
             if isinstance(symbols, list):
                 symbols = json.dumps(symbols, ensure_ascii=False)
 
+            is_signal = item.get("is_signal", True)
             row = {
                 "message_id": item["message_id"],
                 "chat_id": item["chat_id"],
+                "is_signal": is_signal,
                 "direction": item.get("direction"),
                 "magnitude": item.get("magnitude"),
                 "urgency": item.get("urgency"),
@@ -612,7 +615,7 @@ def cmd_write(db_path: str, results_file: str, args: list[str]):
                 "event_type": item.get("event_type"),
                 "reasoning": item.get("reasoning"),
                 "llm_status": "completed",
-                "llm_model": "claude",
+                "llm_model": item.get("llm_model", "claude"),
                 "llm_raw": json.dumps(item, ensure_ascii=False),
                 "factor_version": 2,
             }

@@ -11,6 +11,7 @@ Thumbs.db
 
 # Sensitive config (contains API keys, phone number)
 config.yaml
+.tgwatcher_auth
 
 # Telegram session files
 sessions/
