@@ -46,8 +46,18 @@ def create_app(config_path: str | None = None) -> Flask:
     @app.after_request
     def _no_cache_static(response):
         if response.content_type and ("javascript" in response.content_type or "html" in response.content_type):
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            # no-store: never use cached copy without revalidating
+            # must-revalidate: stale caches must revalidate
+            # max-age=0: immediately stale
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
             response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            # Disable back-forward cache (BFCache) — forces reload on back/fwd navigation
+            response.headers["X-Accel-Expires"] = "0"
+            # Strip conditional-response headers so Flask won't return 304 on
+            # If-None-Match / If-Modified-Since (which would bypass no-store)
+            response.headers.pop("ETag", None)
+            response.headers.pop("Last-Modified", None)
         return response
 
     return app
