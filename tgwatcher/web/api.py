@@ -52,6 +52,7 @@ _rate_limit_store: dict[str, list[float]] = {}
 _signal_service: SignalService | None = None
 _signal_engine: SignalEngine | None = None
 _webhook_dispatcher = None
+_source_quality_tracker = None
 
 MAX_SSE_EVENTS = 200
 
@@ -384,6 +385,12 @@ def _init_signal_engine(config: dict) -> None:
         push_sse_event("signal_process_status", status)
 
     _signal_service = SignalService(_signal_engine, signal_cfg, on_status_change=_on_signal_status)
+    # Source quality tracker — accumulates outcome feedback per chat.
+    # Skeleton: stats stay 0/empty until Selene starts reporting outcomes
+    # via POST /api/signals/<id>/outcome. In-memory only; lost on restart.
+    global _source_quality_tracker
+    from tgwatcher.source_quality import SourceQualityTracker
+    _source_quality_tracker = SourceQualityTracker()
     logger.info(
         "Signal engine initialized (provider=%s, model=%s, webhook=%s)",
         llm_config.provider,
@@ -1514,10 +1521,36 @@ def record_signal_outcome(message_id: int):
         for k, v in list(saved.items()):
             if hasattr(v, "isoformat"):
                 saved[k] = v.isoformat()
+        # Accumulate into source quality tracker (skeleton — no-op effect
+        # until outcomes actually flow in, but the wiring is in place).
+        if _source_quality_tracker is not None:
+            try:
+                _source_quality_tracker.accumulate(saved)
+            except Exception as qe:
+                logger.warning("Source quality tracker accumulate failed: %s", qe)
         return jsonify({"status": "recorded", "outcome": saved})
     except Exception as e:
         logger.error("save_signal_outcome failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+@api.route("/signals/source-quality", methods=["GET"])
+@require_auth
+def get_source_quality():
+    """Return per-chat source quality stats accumulated from outcome feedback.
+
+    Skeleton endpoint: returns zero stats until outcomes flow in (Selene
+    not yet integrated). Per-chat aggregation includes outcome_count,
+    avg_magnitude_pct, direction_distribution, last_outcome_at.
+
+    Optional ?chat_id=<id> filters to a single chat.
+    """
+    if _source_quality_tracker is None:
+        return jsonify({"error": "Source quality tracker not initialized"}), 503
+    chat_id = request.args.get("chat_id", type=int)
+    if chat_id is not None:
+        return jsonify(_source_quality_tracker.stats(chat_id=chat_id))
+    return jsonify(_source_quality_tracker.to_dict())
 
 
 @api.route("/signals/<int:message_id>/outcomes", methods=["GET"])
