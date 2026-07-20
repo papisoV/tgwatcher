@@ -858,8 +858,12 @@ function flashNewSignal(d){
   const el=document.getElementById('newSignalBadge');if(!el)return;
   const dir=d.direction>0?'▲ 利好':d.direction<0?'▼ 利空':'— 中性';
   const sym=(d.symbols||[]).slice(0,3).join('/')||'?';
+  const score=d.signal_score!=null?((d.signal_score>=0?'+':'')+Number(d.signal_score).toFixed(3)):'';
+  const scoreColor=d.signal_score>0.05?'#00ff88':d.signal_score<-0.05?'#ff3d71':'#a0aec0';
+  const scoreHtml=score?` <span style="color:${scoreColor};font-weight:600">${score}</span>`:'';
   el.style.display='inline';
   el.textContent='⚡ '+dir+' '+sym+' '+(d.confidence?(d.confidence*100).toFixed(0)+'%':'');
+  if(scoreHtml){el.insertAdjacentHTML('beforeend',scoreHtml)}
   if(lastSignalFlash)clearTimeout(lastSignalFlash);
   lastSignalFlash=setTimeout(()=>{el.style.display='none'},8000);
 }
@@ -1004,6 +1008,32 @@ function loadSignalEventChart(eventTypes){
   signalEventChart=new Chart(el,{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:colors.slice(0,labels.length),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:'#a0aec0',font:{size:11},padding:8}}}}});
 }
 
+function computeSignalScore(f){
+  // Mirror SignalEngine._build_signal_payload formula:
+  // direction * magnitude * confidence * (0.5 + 0.5 * urgency), range [-1,1]
+  const d=Number(f.direction||0),m=Number(f.magnitude||0),u=Number(f.urgency||0),c=Number(f.confidence||0);
+  if([d,m,u,c].some(x=>Number.isNaN(x)))return 0;
+  return Math.round(d*m*c*(0.5+0.5*u)*10000)/10000;
+}
+function computeExpiresAt(f){
+  // date + 2 * halflife_min, ISO string with tz suffix
+  if(!f.date)return null;
+  const d=new Date(f.date.endsWith('Z')?f.date:f.date+'Z');
+  if(isNaN(d))return null;
+  const hl=Number(f.halflife_min||0);
+  if(!hl)return null;
+  return new Date(d.getTime()+hl*2*60000);
+}
+function fmtExpiresRel(expiresAt){
+  if(!expiresAt)return'-';
+  const now=new Date(),exp=new Date(expiresAt);
+  if(isNaN(exp))return'-';
+  const diffMin=Math.round((exp-now)/60000);
+  if(diffMin<0)return'<span style="color:#6b7a8d">已过期</span>';
+  if(diffMin<60)return'剩 '+diffMin+' 分';
+  const h=Math.floor(diffMin/60),m=diffMin%60;
+  return'剩 '+h+'h'+m+'m';
+}
 async function loadSignalTable(){
   const d=await api('/api/signal/factors?page_size=50');if(!d||!d.items)return;
   const tbody=document.getElementById('signalTableBody');
@@ -1014,7 +1044,12 @@ async function loadSignalTable(){
     const symbols=JSON.parse(f.symbols||'[]').join(',');
     const text=(f.text||'').slice(0,50);
     const date=fmtTime(f.date);
-    return `<tr><td style="white-space:nowrap">${date}</td><td style="color:${dirColor}">${dirLabel} ${dir.toFixed(2)}</td><td>${f.event_type||'-'}</td><td>${(f.magnitude||0).toFixed(2)}</td><td>${(f.urgency||0).toFixed(2)}</td><td>${(f.confidence||0).toFixed(2)}</td><td>${f.halflife_min||'-'}</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text}</td></tr>`;
+    const score=computeSignalScore(f);
+    const scoreColor=score>0.05?'#00ff88':score<-0.05?'#ff3d71':'#6b7a8d';
+    const scoreStr=(score>=0?'+':'')+score.toFixed(3);
+    const expiresAt=computeExpiresAt(f);
+    const expiresRel=fmtExpiresRel(expiresAt);
+    return `<tr><td style="white-space:nowrap">${date}</td><td style="color:${dirColor}">${dirLabel} ${dir.toFixed(2)}</td><td>${f.event_type||'-'}</td><td>${(f.magnitude||0).toFixed(2)}</td><td>${(f.urgency||0).toFixed(2)}</td><td>${(f.confidence||0).toFixed(2)}</td><td style="color:${scoreColor}">${scoreStr}</td><td>${f.halflife_min||'-'}</td><td>${expiresRel}</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text}</td></tr>`;
   }).join('');
 }
 
