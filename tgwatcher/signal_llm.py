@@ -155,6 +155,11 @@ class LLMConfig:
     api_key: str | None = None
     temperature: float = 0.0
     max_tokens: int = 512
+    # Token budget for batch calls (refine_batch). Defaults to max_tokens*2 when
+    # unset — batch prompts pack N messages and expect N JSON objects back, so
+    # 512 tokens clips reasoning on 15-item batches. Set explicitly per provider
+    # in config via providers.<name>.max_tokens_batch.
+    max_tokens_batch: int = 0
     timeout_connect: float = 10.0
     timeout_read: float = 30.0
     timeout_write: float = 30.0
@@ -197,6 +202,7 @@ class LLMConfig:
             model = provider_cfg.get("model", "")
             temperature = provider_cfg.get("temperature", 0.0)
             max_tokens = provider_cfg.get("max_tokens", 512)
+            max_tokens_batch = provider_cfg.get("max_tokens_batch", 0)
         else:
             # Legacy fallback: top-level fields, no `providers:` dict.
             logger.warning(
@@ -209,6 +215,7 @@ class LLMConfig:
             model = llm_cfg.get("model", "")
             temperature = llm_cfg.get("temperature", 0.0)
             max_tokens = llm_cfg.get("max_tokens", 512)
+            max_tokens_batch = llm_cfg.get("max_tokens_batch", 0)
 
         if not base_url:
             raise ValueError(
@@ -238,6 +245,7 @@ class LLMConfig:
             model=model,
             temperature=float(temperature),
             max_tokens=int(max_tokens),
+            max_tokens_batch=int(max_tokens_batch),
             timeout_connect=float(llm_cfg.get("timeout_connect", 10.0)),
             timeout_read=float(llm_cfg.get("timeout_read", 30.0)),
             timeout_write=float(llm_cfg.get("timeout_write", 30.0)),
@@ -309,13 +317,27 @@ class SignalLLMClient:
         self._model = config.model
         self._temperature = config.temperature
         self._max_tokens = config.max_tokens
+        # Batch token budget: 0 means "use max_tokens*2" fallback. Logged so
+        # operators can verify the active value from config.
+        self._max_tokens_batch = config.max_tokens_batch or (config.max_tokens * 2)
         self._max_retries = config.max_retries
 
         logger.info(
             "SignalLLMClient initialized: provider=%s, protocol=%s, "
-            "base_url=%s, model=%s",
+            "base_url=%s, model=%s, max_tokens=%d, max_tokens_batch=%d",
             config.provider, self._protocol, config.base_url, config.model,
+            self._max_tokens, self._max_tokens_batch,
         )
+
+    @property
+    def provider(self) -> str:
+        """Active provider name (e.g. 'astron', 'anthropic')."""
+        return self._provider
+
+    @property
+    def model_name(self) -> str:
+        """Active model name (e.g. 'astron-code-latest', 'claude-sonnet-4-6')."""
+        return self._model
 
     def _format_preliminary_text(self, preliminary_factors: dict[str, Any]) -> str:
         """
@@ -419,33 +441,55 @@ class SignalLLMClient:
 
         return data
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, max_tokens_override: int | None = None) -> str:
         """Dispatch prompt to the configured provider, return raw text response.
 
         Routes to `_call_openai` or `_call_anthropic` based on provider protocol.
         Both paths return the raw model output text; JSON parsing + validation
         is handled by the caller.
+
+        Args:
+            prompt: The user prompt to send.
+            max_tokens_override: If set, use this instead of self._max_tokens.
+                Used by refine_batch to pass self._max_tokens_batch (larger budget
+                for multi-message responses).
         """
         if self._protocol == "openai":
-            return self._call_openai(prompt)
+            return self._call_openai(prompt, max_tokens_override=max_tokens_override)
         elif self._protocol == "anthropic":
-            return self._call_anthropic(prompt)
+            return self._call_anthropic(prompt, max_tokens_override=max_tokens_override)
         # Defensive — protocol validated in __init__.
         raise ValueError(f"Unhandled protocol: {self._protocol}")
 
-    def _call_openai(self, prompt: str) -> str:
+    def _call_openai(self, prompt: str, max_tokens_override: int | None = None) -> str:
         """Call OpenAI-compatible chat completion endpoint.
 
         Uses `response_format={"type":"json_object"}` for structured output.
-        Works with deepseek/openai/openrouter/moonshot/zhipu/ollama.
+        Works with deepseek/openai/openrouter/moonshot/zhipu/ollama/astron.
+
+        Args:
+            max_tokens_override: If set, override self._max_tokens (batch path
+                passes a larger budget so multi-message reasoning isn't clipped).
         """
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-        )
+        max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=self._temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            # Surface provider/model/status context for 503/429/debugging. The
+            # openai SDK retries internally (max_retries) and re-raises — we log
+            # the final failure before the caller's retry loop kicks in.
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
+            logger.warning(
+                "OpenAI call failed: provider=%s model=%s max_tokens=%d status=%s err=%s",
+                self._provider, self._model, max_tokens, status, str(e)[:200],
+            )
+            raise
         usage = response.usage
         if usage:
             logger.info(
@@ -454,20 +498,29 @@ class SignalLLMClient:
             )
         return response.choices[0].message.content.strip()
 
-    def _call_anthropic(self, prompt: str) -> str:
+    def _call_anthropic(self, prompt: str, max_tokens_override: int | None = None) -> str:
         """Call Anthropic Messages API.
 
         Uses ANTHROPIC_JSON_SYSTEM_PROMPT to force JSON output (Anthropic has no
         `response_format` field like OpenAI). Works with both official and
         proxy Anthropic endpoints (base_url set at client construction).
         """
-        response = self._client.messages.create(
-            model=self._model,
-            system=ANTHROPIC_JSON_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-        )
+        max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                system=ANTHROPIC_JSON_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self._temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            logger.warning(
+                "Anthropic call failed: provider=%s model=%s max_tokens=%d status=%s err=%s",
+                self._provider, self._model, max_tokens, status, str(e)[:200],
+            )
+            raise
         # Anthropic response shape: response.content is a list of content blocks;
         # for text response, content[0].text holds the output.
         if not response.content:
@@ -570,7 +623,7 @@ class SignalLLMClient:
         # Try batch call with retry
         for attempt in range(self._max_retries):
             try:
-                raw = self._call_llm(prompt)
+                raw = self._call_llm(prompt, max_tokens_override=self._max_tokens_batch)
 
                 # Defensive JSON parsing: strip markdown code fences
                 if raw.startswith("```"):
@@ -647,6 +700,9 @@ class SignalLLMClient:
             try:
                 result = self.refine(text, preliminary)
                 results.append(result)
-            except LLMRefineError:
+            except LLMRefineError as e:
+                # Log the actual failure reason so signal_engine can surface it
+                # in llm_error instead of the generic "Batch item validation failed".
+                logger.warning("Individual fallback failed: %s", e)
                 results.append(None)
         return results

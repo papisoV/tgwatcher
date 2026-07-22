@@ -176,10 +176,18 @@ def init_services(config, async_loop=None) -> None:
 # ── Auto-poll state ─────────────────────────────────────────────────────
 _auto_poll_state: dict[int, dict] = {}  # {chat_id: {enabled, interval, next_tick_at, name}}
 _auto_poll_lock = threading.Lock()
+# Set by stop_crawl() so the auto-poll daemon suspends triggering new crawls
+# after a user-initiated stop. Cleared when auto-poll is re-enabled via
+# update_auto_poll() or on fresh startup. Distinct from _crawl_service._stop_event
+# (which only halts the currently-running crawl) — this one halts the daemon
+# that would *start* the next crawl.
+_auto_poll_stop_requested: threading.Event = threading.Event()
 
 
 def _init_auto_poll(config: dict) -> None:
     """Populate _auto_poll_state from config (called at startup)."""
+    # Fresh startup — clear any stale stop signal from a previous run.
+    _auto_poll_stop_requested.clear()
     with _auto_poll_lock:
         _auto_poll_state.clear()
         now = time.time()
@@ -201,6 +209,12 @@ def _auto_poll_loop() -> None:
     while True:
         try:
             time.sleep(1)
+            # User clicked stop — suspend triggering new crawls. Do NOT reset
+            # next_tick_at here: the tick stays due so that when the user
+            # re-enables auto-poll (clearing the Event), the next crawl fires
+            # immediately rather than waiting a full interval.
+            if _auto_poll_stop_requested.is_set():
+                continue
             now = time.time()
             # Skip if any crawl currently running — leave next_tick_at untouched so
             # the tick fires as soon as the running crawl finishes (no lost tick).
@@ -929,6 +943,13 @@ def stop_crawl():
     ok = _crawl_service.stop()
     if not ok:
         return jsonify({"error": "No crawl running"}), 409
+    # Signal auto-poll daemon to suspend triggering new crawls. Without this,
+    # the daemon would fire the next tick (often within seconds) and restart
+    # a crawl immediately after the current one stops — making the user's
+    # "stop" feel ignored. Cleared when auto-poll is re-enabled via
+    # update_auto_poll() or on fresh startup via _init_auto_poll().
+    _auto_poll_stop_requested.set()
+    logger.info("Stop requested by user — auto-poll daemon suspended until re-enabled")
     return jsonify({"status": "stopping"})
 
 
@@ -1001,6 +1022,13 @@ def update_auto_poll(chat_id: int):
             s["interval"] = iv
         s["next_tick_at"] = time.time() + s["interval"]
         s["name"] = next((g.get("name", str(chat_id)) for g in _config["groups"] if g.get("id") == chat_id), str(chat_id))
+
+    # Re-enabling auto-poll clears any user-initiated stop signal so the
+    # daemon resumes triggering ticks. This is the only path that clears
+    # _auto_poll_stop_requested besides a fresh startup (_init_auto_poll).
+    if enabled is True:
+        _auto_poll_stop_requested.clear()
+        logger.info("Auto-poll re-enabled by user — stop signal cleared, daemon resumed")
 
     push_sse_event("auto_poll_tick", {
         "chat_id": chat_id,

@@ -10,7 +10,7 @@ groups:
   username: example_channel
   auto_catchup: false
   auto_poll: false              # Web UI 启动后自动轮询
-  poll_interval_seconds: 15      # 轮询间隔（秒）
+  poll_interval_seconds: 15     # 轮询间隔（秒）。建议 ≥15；<15s 会频繁空跑 Telegram API，近实时需求建议改用 auto_listen
   auto_listen: false             # 实时监听新消息（Telethon NewMessage 事件）
 proxy:
   enabled: false
@@ -68,6 +68,7 @@ signal:
         model: astron-code-latest
         temperature: 0
         max_tokens: 512
+        max_tokens_batch: 1024  # 批处理专用 token 预算；0 或缺省 = max_tokens*2
     timeout_connect: 30
     timeout_read: 60
     timeout_write: 30

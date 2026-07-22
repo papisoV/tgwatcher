@@ -96,7 +96,7 @@ class SignalEngine:
                 "event_type": llm_result["event_type"],
                 "reasoning": llm_result.get("reasoning", ""),
                 "llm_status": "completed",
-                "llm_model": f"{self._config.get('llm', {}).get('provider', 'unknown')}:{self._config.get('llm', {}).get('model', '')}",
+                "llm_model": f"{self._llm.provider}:{self._llm.model_name}",
                 "llm_raw": json.dumps(llm_result, ensure_ascii=False),
             })
         except (LLMRefineError, Exception) as e:
@@ -196,17 +196,23 @@ class SignalEngine:
                         "event_type": llm_result["event_type"],
                         "reasoning": llm_result.get("reasoning", ""),
                         "llm_status": "completed",
-                        "llm_model": f"{self._config.get('llm', {}).get('provider', 'unknown')}:{self._config.get('llm', {}).get('model', '')}",
+                        "llm_model": f"{self._llm.provider}:{self._llm.model_name}",
                         "llm_raw": json.dumps(llm_result, ensure_ascii=False),
                     })
                     completed += 1
                 else:
+                    # refine_batch returned None for this item — means batch API
+                    # failed AND individual fallback also failed (503/JSON parse/
+                    # validation). The exact reason is logged in signal_llm.py;
+                    # surface a more accurate error text than the old "Batch item
+                    # validation failed" which conflated call-failure with
+                    # schema-validation-failure.
                     factor_data.update({
                         "llm_status": "failed",
-                        "llm_error": "Batch item validation failed",
+                        "llm_error": "LLM call failed (batch + fallback exhausted; see signal_llm logs for reason)",
                     })
                     failed += 1
-                    errors.append(f"msg {msg['message_id']}: validation failed in batch")
+                    errors.append(f"msg {msg['message_id']}: LLM call failed (batch + fallback)")
 
                 # Activate is_signal flag consistently with process_message path.
                 # Without this, batch-processed rows keep the column's default (True)
