@@ -441,7 +441,8 @@ class SignalLLMClient:
 
         return data
 
-    def _call_llm(self, prompt: str, max_tokens_override: int | None = None) -> str:
+    def _call_llm(self, prompt: str, max_tokens_override: int | None = None,
+                 json_mode: bool = True) -> str:
         """Dispatch prompt to the configured provider, return raw text response.
 
         Routes to `_call_openai` or `_call_anthropic` based on provider protocol.
@@ -453,41 +454,52 @@ class SignalLLMClient:
             max_tokens_override: If set, use this instead of self._max_tokens.
                 Used by refine_batch to pass self._max_tokens_batch (larger budget
                 for multi-message responses).
+            json_mode: If True (default), force JSON-structured output (used by
+                refine/refine_batch for factor extraction). If False, allow
+                free-form text (used by daily_digest for prose summaries).
         """
         if self._protocol == "openai":
-            return self._call_openai(prompt, max_tokens_override=max_tokens_override)
+            return self._call_openai(prompt, max_tokens_override=max_tokens_override,
+                                     json_mode=json_mode)
         elif self._protocol == "anthropic":
-            return self._call_anthropic(prompt, max_tokens_override=max_tokens_override)
+            return self._call_anthropic(prompt, max_tokens_override=max_tokens_override,
+                                        json_mode=json_mode)
         # Defensive — protocol validated in __init__.
         raise ValueError(f"Unhandled protocol: {self._protocol}")
 
-    def _call_openai(self, prompt: str, max_tokens_override: int | None = None) -> str:
+    def _call_openai(self, prompt: str, max_tokens_override: int | None = None,
+                     json_mode: bool = True) -> str:
         """Call OpenAI-compatible chat completion endpoint.
 
-        Uses `response_format={"type":"json_object"}` for structured output.
-        Works with deepseek/openai/openrouter/moonshot/zhipu/ollama/astron.
+        Uses `response_format={"type":"json_object"}` for structured output when
+        json_mode is True (default). Works with deepseek/openai/openrouter/
+        moonshot/zhipu/ollama/astron.
 
         Args:
             max_tokens_override: If set, override self._max_tokens (batch path
                 passes a larger budget so multi-message reasoning isn't clipped).
+            json_mode: If False, omit response_format for free-form text output
+                (digest summaries, conversational responses).
         """
         max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
+        kwargs = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self._temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=self._temperature,
-                max_tokens=max_tokens,
-            )
+            response = self._client.chat.completions.create(**kwargs)
         except Exception as e:
             # Surface provider/model/status context for 503/429/debugging. The
             # openai SDK retries internally (max_retries) and re-raises — we log
             # the final failure before the caller's retry loop kicks in.
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             logger.warning(
-                "OpenAI call failed: provider=%s model=%s max_tokens=%d status=%s err=%s",
-                self._provider, self._model, max_tokens, status, str(e)[:200],
+                "OpenAI call failed: provider=%s model=%s max_tokens=%d json_mode=%s status=%s err=%s",
+                self._provider, self._model, max_tokens, json_mode, status, str(e)[:200],
             )
             raise
         usage = response.usage
@@ -498,18 +510,26 @@ class SignalLLMClient:
             )
         return response.choices[0].message.content.strip()
 
-    def _call_anthropic(self, prompt: str, max_tokens_override: int | None = None) -> str:
+    def _call_anthropic(self, prompt: str, max_tokens_override: int | None = None,
+                        json_mode: bool = True) -> str:
         """Call Anthropic Messages API.
 
         Uses ANTHROPIC_JSON_SYSTEM_PROMPT to force JSON output (Anthropic has no
         `response_format` field like OpenAI). Works with both official and
         proxy Anthropic endpoints (base_url set at client construction).
+
+        Args:
+            json_mode: If False, use a neutral system prompt for free-form text
+                output (digest summaries, conversational responses).
         """
         max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
+        system_prompt = ANTHROPIC_JSON_SYSTEM_PROMPT if json_mode else (
+            "You are a helpful assistant. Respond in natural language."
+        )
         try:
             response = self._client.messages.create(
                 model=self._model,
-                system=ANTHROPIC_JSON_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=self._temperature,
                 max_tokens=max_tokens,
@@ -517,8 +537,8 @@ class SignalLLMClient:
         except Exception as e:
             status = getattr(e, "status_code", None)
             logger.warning(
-                "Anthropic call failed: provider=%s model=%s max_tokens=%d status=%s err=%s",
-                self._provider, self._model, max_tokens, status, str(e)[:200],
+                "Anthropic call failed: provider=%s model=%s max_tokens=%d json_mode=%s status=%s err=%s",
+                self._provider, self._model, max_tokens, json_mode, status, str(e)[:200],
             )
             raise
         # Anthropic response shape: response.content is a list of content blocks;
