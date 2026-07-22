@@ -448,6 +448,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
       <button class="tab-btn" data-tab="dashboard" onclick="switchTab('dashboard')">仪表盘</button>
       <button class="tab-btn" data-tab="groups" onclick="switchTab('groups')">群组</button>
       <button class="tab-btn" data-tab="signal" onclick="switchTab('signal')">信号</button>
+      <button class="tab-btn" data-tab="digest" onclick="switchTab('digest')">摘要</button>
     </div>
     <div class="top-bar__right">
       <div class="crawl-indicator">
@@ -629,6 +630,25 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
         </div>
       </div>
 
+      <!-- DIGEST VIEW -->
+      <div class="view" id="viewDigest">
+        <div style="padding:12px 16px 0;display:flex;align-items:center;gap:10px">
+          <h2 style="font-size:var(--fs-lg);font-weight:600">市场摘要</h2>
+          <button class="btn btn-cyan" id="btnDigestGenerate" onclick="generateDigest()" style="font-size:var(--fs-xs);padding:2px 8px;margin-left:8px">生成新摘要</button>
+          <button class="btn" id="btnDigestRefresh" onclick="loadDigestTab()" style="font-size:var(--fs-xs);padding:2px 8px;display:none">刷新</button>
+          <span id="digestStatus" style="font-size:var(--fs-xs);color:var(--text-2);margin-left:auto"></span>
+        </div>
+        <div class="dashboard-body">
+          <div id="digestLatest" style="padding:12px 16px;border:1px solid var(--border);border-radius:6px;background:var(--bg-1);white-space:pre-wrap;font-size:var(--fs-sm);line-height:1.6;min-height:120px">
+            <span style="color:var(--text-2)">点击"生成新摘要"开始...</span>
+          </div>
+          <div class="chart-section">
+            <div class="chart-section__title">历史摘要</div>
+            <div id="digestHistory" style="display:flex;flex-direction:column;gap:6px;max-height:400px;overflow:auto"></div>
+          </div>
+        </div>
+      </div>
+
       <!-- GROUPS VIEW -->
       <div class="view" id="viewGroups">
         <div class="groups-toolbar">
@@ -651,6 +671,6 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
   </div>
 </div>
 
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

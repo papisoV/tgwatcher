@@ -8,13 +8,13 @@ from sqlalchemy import tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from tgwatcher.models import Base, Chat, Message, Sender, SignalFactor, SignalOutcome
+from tgwatcher.models import Base, Chat, Message, Sender, SignalFactor, SignalOutcome, Digest
 from tgwatcher.schemas import EditUpdate, ParsedChat, ParsedMessage, ParsedSender
 from tgwatcher.tz_utils import utc_now, local_to_utc, sql_tz_shift, tz_offset_hours
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class Storage:
@@ -69,6 +69,8 @@ class Storage:
             self._migrate_v5_to_v6()
         if from_version < 7:
             self._migrate_v6_to_v7()
+        if from_version < 8:
+            self._migrate_v7_to_v8()
 
     def _migrate_v1_to_v2(self) -> None:
         logger.info("Migrating schema v1 -> v2 ...")
@@ -162,6 +164,13 @@ class Storage:
         Base.metadata.create_all(self.engine, tables=[SignalOutcome.__table__])
         self._set_schema_version(7)
         logger.info("Migration v6 -> v7 complete")
+
+    def _migrate_v7_to_v8(self) -> None:
+        """Create digests table for AI market summaries."""
+        logger.info("Migrating schema v7 -> v8 (create digests table) ...")
+        Base.metadata.create_all(self.engine, tables=[Digest.__table__])
+        self._set_schema_version(8)
+        logger.info("Migration v7 -> v8 complete")
 
     def get_session(self) -> Session:
         return self._session_factory()

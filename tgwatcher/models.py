@@ -127,3 +127,19 @@ class SignalOutcome(Base):
     price_tn: Mapped[float | None] = mapped_column(Float)                  # price at T+N
     note: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str | None] = mapped_column(String(64))                 # which downstream system reported
+
+
+class Digest(Base):
+    """AI-generated market digest covering a time window [from_at, to_at].
+
+    Each row is one digest generation. `to_at` of the latest row serves as
+    the "last_digest_at" marker — next generation starts from there.
+    """
+    __tablename__ = "digests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    from_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    to_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    signal_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))

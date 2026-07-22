@@ -1621,3 +1621,64 @@ def test_webhook():
     result = _webhook_dispatcher.send_test(target_url)
     return jsonify(result)
 
+
+# ===== Market digest (AI-generated summary for the user, not Selene) =====
+
+import threading as _threading
+_digest_lock = _threading.Lock()
+
+
+@api.route("/digest/generate", methods=["POST"])
+@require_auth
+def generate_digest():
+    """Generate a new market digest. Covers last window (cold start 36h, else
+    last_digest_at → now, capped at 36h). Persists to digests table.
+
+    Concurrency: module-level Lock — only one generation at a time. If a
+    request is already running, returns 409.
+    """
+    if not _storage:
+        return jsonify({"error": "Storage not initialized"}), 500
+    if not _signal_engine or not getattr(_signal_engine, "_llm", None):
+        return jsonify({"error": "Signal engine / LLM not initialized"}), 500
+
+    if not _digest_lock.acquire(blocking=False):
+        return jsonify({"error": "Another digest generation is in progress"}), 409
+
+    try:
+        from tgwatcher.digest import generate_digest as _gen
+        try:
+            result = _gen(_storage, _signal_engine._llm)
+        except Exception as e:
+            logger.exception("Digest generation failed")
+            return jsonify({"error": f"Generation failed: {e}"}), 500
+        return jsonify(result.to_dict())
+    finally:
+        _digest_lock.release()
+
+
+@api.route("/digest/latest", methods=["GET"])
+@require_auth
+def get_latest_digest():
+    """Return most recent digest (does NOT trigger LLM)."""
+    if not _storage:
+        return jsonify({"error": "Storage not initialized"}), 500
+    from tgwatcher.digest import get_latest_digest as _get
+    result = _get(_storage)
+    if result is None:
+        return jsonify(None), 404
+    return jsonify(result.to_dict())
+
+
+@api.route("/digest/history", methods=["GET"])
+@require_auth
+def list_digests():
+    """Return recent digests, newest first. ?limit=N (default 20, max 100)."""
+    if not _storage:
+        return jsonify({"error": "Storage not initialized"}), 500
+    limit = request.args.get("limit", type=int, default=20)
+    limit = max(1, min(limit, 100))
+    from tgwatcher.digest import list_digests as _list
+    rows = _list(_storage, limit=limit)
+    return jsonify([r.to_dict() for r in rows])
+

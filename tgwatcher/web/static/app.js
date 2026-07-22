@@ -501,9 +501,58 @@ function switchTab(tab){
   document.getElementById('viewDashboard').classList.toggle('active',tab==='dashboard');
   document.getElementById('viewGroups').classList.toggle('active',tab==='groups');
   document.getElementById('viewSignal').classList.toggle('active',tab==='signal');
+  document.getElementById('viewDigest').classList.toggle('active',tab==='digest');
   if(tab==='dashboard')loadDashboardTab();
   if(tab==='groups')loadGroupsView();
   if(tab==='signal')loadSignalTab();
+  if(tab==='digest')loadDigestTab();
+}
+
+// ===== DIGEST =====
+async function loadDigestTab(){
+  const latest=await api('/api/digest/latest');
+  const latestEl=document.getElementById('digestLatest');
+  if(latest&&latest.summary){
+    latestEl.textContent=latest.summary;
+    latestEl.style.color='var(--text-0)';
+  }else{
+    latestEl.innerHTML='<span style="color:var(--text-2)">尚无摘要。点击"生成新摘要"开始。</span>';
+  }
+  const hist=await api('/api/digest/history?limit=20');
+  const histEl=document.getElementById('digestHistory');
+  if(!hist||!hist.length){
+    histEl.innerHTML='<span style="color:var(--text-2);font-size:var(--fs-sm)">无历史摘要</span>';
+    return;
+  }
+  histEl.innerHTML=hist.map(d=>`
+    <div style="padding:8px 10px;border:1px solid var(--border);border-radius:4px;cursor:pointer;background:var(--bg-2)" onclick="showDigestInLatest(this)" data-summary="${d.summary.replace(/"/g,'&quot;')}">
+      <div style="font-size:var(--fs-xs);color:var(--text-2)">${d.created_at?d.created_at.slice(0,16).replace('T',' '):''} · ${d.signal_count}条信号 · ${d.from_at?d.from_at.slice(5,16).replace('T',' '):''} → ${d.to_at?d.to_at.slice(5,16).replace('T',' '):''}</div>
+      <div style="font-size:var(--fs-sm);color:var(--text-1);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.summary.slice(0,80)}...</div>
+    </div>
+  `).join('');
+}
+function showDigestInLatest(el){
+  const s=el.dataset.summary;
+  const latestEl=document.getElementById('digestLatest');
+  latestEl.textContent=s;
+  latestEl.style.color='var(--text-0)';
+}
+async function generateDigest(){
+  const btn=document.getElementById('btnDigestGenerate');
+  const status=document.getElementById('digestStatus');
+  btn.disabled=true;btn.textContent='生成中...';status.textContent='调用 LLM 中（约 5-15 秒）';
+  try{
+    const r=await api('/api/digest/generate','POST');
+    if(!r){status.textContent='生成失败';return;}
+    const latestEl=document.getElementById('digestLatest');
+    latestEl.textContent=r.summary;latestEl.style.color='var(--text-0)';
+    status.textContent=`生成完毕 · ${r.signal_count}条信号 · ${r.from_at?r.from_at.slice(5,16).replace('T',' '):''} → ${r.to_at?r.to_at.slice(5,16).replace('T',' '):''}`;
+    loadDigestTab();
+  }catch(e){
+    status.textContent='生成失败: '+(e?.message||e);
+  }finally{
+    btn.disabled=false;btn.textContent='生成新摘要';
+  }
 }
 
 // ===== DASHBOARD =====
