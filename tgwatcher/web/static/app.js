@@ -1091,7 +1091,7 @@ async function loadSignalTable(){
     const dirColor=dir>0.1?'#00ff88':dir<-0.1?'#ff3d71':'#6b7a8d';
     const dirLabel=dir>0.1?'利多':dir<-0.1?'利空':'中性';
     const symbols=JSON.parse(f.symbols||'[]').join(',');
-    const text=(f.text||'').slice(0,50);
+    const text=esc((f.text||'').slice(0,50));
     const date=fmtTime(f.date);
     const score=computeSignalScore(f);
     const scoreColor=score>0.05?'#00ff88':score<-0.05?'#ff3d71':'#6b7a8d';

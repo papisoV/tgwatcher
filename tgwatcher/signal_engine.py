@@ -162,6 +162,7 @@ class SignalEngine:
                     "chat_id": msg["chat_id"],
                     "llm_status": "processing",
                     "filter_result": "passed",
+                    "is_signal": False,  # avoid transient True (column default) before LLM verdict
                     "matched_keywords": json.dumps(filter_result.matched_keywords, ensure_ascii=False),
                     "keyword_preliminary": json.dumps(filter_result.preliminary_factors, ensure_ascii=False),
                     "factor_version": self._factor_version,

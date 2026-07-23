@@ -726,7 +726,8 @@ class Storage:
                 if date_to:
                     q = q.filter(Message.date <= date_to)
             total = q.count()
-            # Direction distribution
+            # Direction distribution — q.filter() returns a new Query,
+            # so each count is independent (no accumulation across calls).
             bullish = q.filter(SignalFactor.direction > 0).count()
             bearish = q.filter(SignalFactor.direction < 0).count()
             neutral = q.filter(SignalFactor.direction == 0).count()

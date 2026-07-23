@@ -334,7 +334,6 @@ async def _run_listener_async(listen_groups: list[dict]) -> None:
             _listener_running = False
         logger.info("Listener thread exiting")
         push_sse_event("listener_status", {"enabled": False})
-        push_sse_event("listener_status", {"enabled": False})
 
 
 def _stop_listener() -> bool:
@@ -420,7 +419,10 @@ def push_sse_event(event_type: str, data: dict) -> None:
         event = {"id": _sse_event_id, "type": event_type, "data": data}
         _sse_events.append(event)
         if len(_sse_events) > MAX_SSE_EVENTS:
-            del _sse_events[:MAX_SSE_EVENTS // 2]
+            # Keep the newest MAX_SSE_EVENTS events. Older events are dropped;
+            # clients reconnecting with last_id below the new floor are handled
+            # by the Last-Event-ID fallback in the SSE endpoint.
+            del _sse_events[: len(_sse_events) - MAX_SSE_EVENTS]
         for listener in _sse_listeners:
             listener.set()
 
@@ -1241,7 +1243,7 @@ def sse_stream():
                 # Keep event list bounded (secondary check)
                 with _sse_lock:
                     if len(_sse_events) > MAX_SSE_EVENTS:
-                        del _sse_events[:MAX_SSE_EVENTS // 2]
+                        del _sse_events[: len(_sse_events) - MAX_SSE_EVENTS]
         except GeneratorExit:
             pass
         finally:

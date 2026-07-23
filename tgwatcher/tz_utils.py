@@ -39,13 +39,19 @@ def utc_now() -> datetime:
 
 
 def local_to_utc(dt: datetime) -> datetime:
-    """Convert a naive local datetime to naive UTC datetime.
+    """Convert a local datetime to naive UTC datetime.
 
     Used when the API/frontend sends a local date and we need to query
     against UTC-stored Message.date.
+
+    Accepts both naive (interpreted as configured local time) and aware
+    datetimes (normalized to UTC). Aware inputs are converted to UTC, then
+    dropped to naive to match the SQLite convention.
     """
     if dt.tzinfo is not None:
-        raise ValueError(f"local_to_utc expects naive datetime, got tzinfo={dt.tzinfo}")
+        # Aware: convert to UTC and drop tzinfo
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    # Naive: interpret as configured local time
     return dt - timedelta(hours=_TZ_OFFSET_HOURS)
 
 
@@ -53,9 +59,12 @@ def utc_to_local(dt: datetime) -> datetime:
     """Convert a naive UTC datetime to naive local datetime.
 
     Used when displaying DB timestamps to the user.
+
+    If an aware datetime is passed, it is first converted to UTC, then to
+    local — so passing UTC-aware values also works correctly.
     """
     if dt.tzinfo is not None:
-        raise ValueError(f"utc_to_local expects naive datetime, got tzinfo={dt.tzinfo}")
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt + timedelta(hours=_TZ_OFFSET_HOURS)
 
 

@@ -75,18 +75,23 @@ def load_llm_config() -> LLMConfig:
 
 
 def fetch_signals(hours: int) -> list[dict]:
-    """Fetch is_signal=1 records from the last N hours."""
+    """Fetch is_signal=1 records from the last N hours (by message time, not
+    processing time — so batch-processed old messages don't contaminate the
+    window)."""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute(
         """
-        SELECT message_id, direction, magnitude, urgency, confidence,
-               halflife_min, symbols, event_type, reasoning, created_at
-        FROM signal_factors
-        WHERE is_signal = 1 AND llm_status = 'completed'
-          AND created_at > datetime('now', ?)
-        ORDER BY created_at DESC
+        SELECT sf.message_id, sf.direction, sf.magnitude, sf.urgency,
+               sf.confidence, sf.halflife_min, sf.symbols, sf.event_type,
+               sf.reasoning, sf.created_at, m.date AS message_date
+        FROM signal_factors sf
+        JOIN messages m ON sf.message_id = m.message_id
+                       AND sf.chat_id = m.chat_id
+        WHERE sf.is_signal = 1 AND sf.llm_status = 'completed'
+          AND m.date > datetime('now', ?)
+        ORDER BY m.date DESC
         """,
         (f"-{hours} hours",),
     )
@@ -141,12 +146,12 @@ def aggregate(signals: list[dict], hours: int) -> dict:
     # High-confidence events (top 8, confidence >= 0.8)
     high_conf = sorted(
         [s for s in signals if s["confidence"] >= 0.8],
-        key=lambda s: s["created_at"],
+        key=lambda s: s["message_date"],
         reverse=True,
     )[:8]
     high_conf_lines = []
     for s in high_conf:
-        time_str = s["created_at"][5:16].replace("T", " ")  # MM-DD HH:MM
+        time_str = (s["message_date"] or s["created_at"])[5:16].replace("T", " ")  # MM-DD HH:MM
         try:
             syms = json.loads(s["symbols"]) if s["symbols"] else ["*"]
             sym_str = "/".join(syms)
