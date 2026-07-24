@@ -1,0 +1,168 @@
+"""Schema migration runner for the Storage layer.
+
+Encapsulates all vN->vN+1 migration logic and schema-version bookkeeping.
+Extracted from the monolithic `Storage` class during Phase 1A refactor
+(plan: ticklish-cooking-glade.md, Phase 1A).
+
+Contract: `MigrationRunner(engine).run_migrations(from_version)` runs every
+migration with version > from_version, in order. Each migration is responsible
+for calling `set_schema_version(N)` on success. Returns the new version.
+"""
+from __future__ import annotations
+
+import logging
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.engine import Engine
+
+from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest
+
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 8
+
+
+class MigrationRunner:
+    """Runs schema migrations from a given version up to SCHEMA_VERSION."""
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+
+    def get_schema_version(self) -> int:
+        with self.engine.connect() as conn:
+            try:
+                result = conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
+                row = result.fetchone()
+                return row[0] if row else 1
+            except Exception:
+                return 1
+
+    def set_schema_version(self, version: int) -> None:
+        with self.engine.connect() as conn:
+            conn.execute(text("DELETE FROM schema_version"))
+            conn.execute(text("INSERT INTO schema_version (version) VALUES (:v)"), {"v": version})
+            conn.commit()
+
+    def run_migrations(self, from_version: int) -> None:
+        logger.info(
+            "Schema migration starting",
+            extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_start"},
+        )
+        if from_version < 2:
+            self._migrate_v1_to_v2()
+        if from_version < 3:
+            self._migrate_v2_to_v3()
+        if from_version < 4:
+            self._migrate_v3_to_v4()
+        if from_version < 5:
+            self._migrate_v4_to_v5()
+        if from_version < 6:
+            self._migrate_v5_to_v6()
+        if from_version < 7:
+            self._migrate_v6_to_v7()
+        if from_version < 8:
+            self._migrate_v7_to_v8()
+        logger.info(
+            "Schema migration complete",
+            extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_complete"},
+        )
+
+    def _migrate_v1_to_v2(self) -> None:
+        logger.info("Migrating schema v1 -> v2 ...")
+        new_columns = [
+            ("is_edited", "BOOLEAN DEFAULT 0"),
+            ("edited_at", "DATETIME"),
+            ("is_deleted", "BOOLEAN DEFAULT 0"),
+            ("media_type", "VARCHAR(32)"),
+            ("media_id", "VARCHAR(256)"),
+        ]
+        with self.engine.connect() as conn:
+            for col_name, col_type in new_columns:
+                try:
+                    conn.execute(text(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"))
+                except OperationalError:
+                    pass  # Column already exists
+
+            # Backfill chats
+            conn.execute(text(
+                "INSERT OR IGNORE INTO chats (chat_id, chat_title, updated_at) "
+                "SELECT DISTINCT chat_id, chat_title, datetime('now') "
+                "FROM messages WHERE chat_id IS NOT NULL"
+            ))
+
+            # Backfill senders (pick most recent name per sender_id)
+            conn.execute(text(
+                "INSERT OR IGNORE INTO senders (sender_id, sender_name, sender_username, updated_at) "
+                "SELECT m.sender_id, "
+                "(SELECT m2.sender_name FROM messages m2 WHERE m2.sender_id = m.sender_id "
+                " AND m2.sender_name IS NOT NULL ORDER BY m2.id DESC LIMIT 1), "
+                "(SELECT m3.sender_username FROM messages m3 WHERE m3.sender_id = m.sender_id "
+                " AND m3.sender_username IS NOT NULL ORDER BY m3.id DESC LIMIT 1), "
+                "datetime('now') "
+                "FROM messages m WHERE m.sender_id IS NOT NULL GROUP BY m.sender_id"
+            ))
+
+            # New indexes
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_is_deleted ON messages (is_deleted)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_media_type ON messages (media_type)"))
+            conn.commit()
+
+        self.set_schema_version(2)
+        logger.info("Migration v1 -> v2 complete")
+
+    def _migrate_v2_to_v3(self) -> None:
+        logger.info("Migrating schema v2 -> v3 (server defaults) ...")
+        with self.engine.connect() as conn:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_chat_id_date ON messages (chat_id, date)"))
+            conn.commit()
+        self.set_schema_version(3)
+        logger.info("Migration v2 -> v3 complete")
+
+    def _migrate_v3_to_v4(self) -> None:
+        logger.info("Migrating schema v3 -> v4 (signal_factors table) ...")
+        Base.metadata.create_all(self.engine, tables=[SignalFactor.__table__])
+        self.set_schema_version(4)
+        logger.info("Migration v3 -> v4 complete")
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Drop old signal_factors and claude_factors tables, recreate with new schema."""
+        logger.info("Migrating schema v4 -> v5 (new factor schema) ...")
+        with self.engine.connect() as conn:
+            # Drop old tables — data is being discarded per user request
+            conn.execute(text("DROP TABLE IF EXISTS signal_factors"))
+            conn.execute(text("DROP TABLE IF EXISTS claude_factors"))
+            conn.commit()
+        # Recreate with new schema
+        Base.metadata.create_all(self.engine, tables=[SignalFactor.__table__])
+        self.set_schema_version(5)
+        logger.info("Migration v4 -> v5 complete (old factor data discarded)")
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Add is_signal column to signal_factors table."""
+        logger.info("Migrating schema v5 -> v6 (add is_signal column) ...")
+        with self.engine.connect() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE signal_factors ADD COLUMN is_signal BOOLEAN DEFAULT 1"
+                ))
+            except OperationalError:
+                pass  # Column already exists
+            conn.commit()
+        self.set_schema_version(6)
+        logger.info("Migration v5 -> v6 complete")
+
+    def _migrate_v6_to_v7(self) -> None:
+        """Create signal_outcomes table for downstream feedback."""
+        logger.info("Migrating schema v6 -> v7 (create signal_outcomes table) ...")
+        # Base.metadata.create_all already creates new tables on init_db, but
+        # if the DB pre-existed, we still need to ensure the table exists.
+        Base.metadata.create_all(self.engine, tables=[SignalOutcome.__table__])
+        self.set_schema_version(7)
+        logger.info("Migration v6 -> v7 complete")
+
+    def _migrate_v7_to_v8(self) -> None:
+        """Create digests table for AI market summaries."""
+        logger.info("Migrating schema v7 -> v8 (create digests table) ...")
+        Base.metadata.create_all(self.engine, tables=[Digest.__table__])
+        self.set_schema_version(8)
+        logger.info("Migration v7 -> v8 complete")
