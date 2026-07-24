@@ -57,6 +57,10 @@ class Storage:
             conn.commit()
 
     def _run_migrations(self, from_version: int) -> None:
+        logger.info(
+            "Schema migration starting",
+            extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_start"},
+        )
         if from_version < 2:
             self._migrate_v1_to_v2()
         if from_version < 3:
@@ -71,6 +75,10 @@ class Storage:
             self._migrate_v6_to_v7()
         if from_version < 8:
             self._migrate_v7_to_v8()
+        logger.info(
+            "Schema migration complete",
+            extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_complete"},
+        )
 
     def _migrate_v1_to_v2(self) -> None:
         logger.info("Migrating schema v1 -> v2 ...")

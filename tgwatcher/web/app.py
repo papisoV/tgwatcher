@@ -8,10 +8,15 @@ from pathlib import Path
 from flask import Flask, send_from_directory, Response
 
 from tgwatcher.config_schema import validate_config
+from tgwatcher.logging_config import setup_logging
 from tgwatcher.web.api import api, init_services
 from tgwatcher.web.async_loop import AsyncLoopManager
 import yaml
 
+# Configure structured logging before any app code runs so init-time log
+# calls (storage migration, signal engine init) go through the new formatter.
+# Level read from config later in create_app; for now use INFO as a safe floor.
+setup_logging(level=os.environ.get("TGWATCHER_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 
@@ -50,6 +55,11 @@ def create_app(config_path: str | None = None) -> Flask:
     config_path = _resolve_config_path(config_path)
     config = _load_config(config_path)
 
+    # Re-apply setup_logging with config-derived level so debug etc. honors
+    # config.yaml if the env var wasn't set explicitly.
+    cfg_level = config.get("logging", {}).get("level") or os.environ.get("TGWATCHER_LOG_LEVEL", "INFO")
+    setup_logging(level=cfg_level)
+
     from tgwatcher.tz_utils import set_tz_offset
     set_tz_offset(config.get("timezone", {}).get("utc_offset_hours", 8))
 
@@ -59,6 +69,10 @@ def create_app(config_path: str | None = None) -> Flask:
 
     async_loop = AsyncLoopManager()
     async_loop.start()
+    logger.info(
+        "init_services starting",
+        extra={"component": "init", "signal_enabled": bool(config.get("signal", {}).get("enabled", False))},
+    )
     init_services(config, async_loop=async_loop)
 
     @app.route("/")

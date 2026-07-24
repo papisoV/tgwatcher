@@ -323,10 +323,15 @@ class SignalLLMClient:
         self._max_retries = config.max_retries
 
         logger.info(
-            "SignalLLMClient initialized: provider=%s, protocol=%s, "
-            "base_url=%s, model=%s, max_tokens=%d, max_tokens_batch=%d",
-            config.provider, self._protocol, config.base_url, config.model,
-            self._max_tokens, self._max_tokens_batch,
+            "SignalLLMClient initialized",
+            extra={
+                "provider": config.provider,
+                "protocol": self._protocol,
+                "base_url": config.base_url,
+                "model": config.model,
+                "max_tokens": self._max_tokens,
+                "max_tokens_batch": self._max_tokens_batch,
+            },
         )
 
     @property
@@ -498,8 +503,15 @@ class SignalLLMClient:
             # the final failure before the caller's retry loop kicks in.
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             logger.warning(
-                "OpenAI call failed: provider=%s model=%s max_tokens=%d json_mode=%s status=%s err=%s",
-                self._provider, self._model, max_tokens, json_mode, status, str(e)[:200],
+                "OpenAI call failed",
+                extra={
+                    "provider": self._provider,
+                    "model": self._model,
+                    "max_tokens": max_tokens,
+                    "json_mode": json_mode,
+                    "status": status,
+                    "error": str(e)[:200],
+                },
             )
             raise
         usage = response.usage
@@ -537,8 +549,15 @@ class SignalLLMClient:
         except Exception as e:
             status = getattr(e, "status_code", None)
             logger.warning(
-                "Anthropic call failed: provider=%s model=%s max_tokens=%d json_mode=%s status=%s err=%s",
-                self._provider, self._model, max_tokens, json_mode, status, str(e)[:200],
+                "Anthropic call failed",
+                extra={
+                    "provider": self._provider,
+                    "model": self._model,
+                    "max_tokens": max_tokens,
+                    "json_mode": json_mode,
+                    "status": status,
+                    "error": str(e)[:200],
+                },
             )
             raise
         # Anthropic response shape: response.content is a list of content blocks;

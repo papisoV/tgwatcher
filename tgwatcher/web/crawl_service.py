@@ -110,7 +110,7 @@ class CrawlService:
         )
         thread = threading.Thread(target=self._run_loop, args=(mode,), daemon=True)
         thread.start()
-        logger.info("Crawl service started (mode=%s)", mode)
+        logger.info("Crawl service started", extra={"mode": mode, "action": "crawl_start"})
         return True
 
     def stop(self) -> bool:
@@ -135,10 +135,10 @@ class CrawlService:
                 finally:
                     loop.close()
         except TimeoutError:
-            logger.error("Crawl timed out after 1 hour")
+            logger.error("Crawl timed out after 1 hour", extra={"mode": mode, "action": "crawl_timeout"})
             self._update_status(error="爬取超时 (1小时)")
         except Exception as e:
-            logger.error("Crawl service error: %s", e)
+            logger.error("Crawl service error", extra={"mode": mode, "error": str(e), "action": "crawl_error"})
             self._update_status(error=str(e))
         finally:
             self._stop_event.set()
@@ -347,5 +347,10 @@ class CrawlService:
             delay = random.uniform(tg.min_delay, tg.max_delay)
             await asyncio.sleep(delay)
 
-        logger.info("Fetched %d messages from %s", len(messages), getattr(entity, "title", chat_id))
+        logger.info("Fetched messages", extra={
+            "group_id": getattr(entity, "id", chat_id),
+            "group_name": getattr(entity, "title", None) or str(chat_id),
+            "fetched": len(messages),
+            "action": "fetch_complete",
+        })
         return messages

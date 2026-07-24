@@ -295,12 +295,15 @@ def _auto_poll_loop() -> None:
                 # Other due groups: reschedule to next cycle too (avoid back-to-back stacking)
                 for other_cid, other_s in due[1:]:
                     other_s["next_tick_at"] = now + other_s["interval"]
-            logger.info("Auto-poll: triggering incremental crawl for %s (%s)", s.get("name"), cid)
+            logger.info(
+                "Auto-poll: triggering incremental crawl",
+                extra={"chat_id": cid, "chat_name": s.get("name"), "action": "crawl_start"},
+            )
             try:
                 if _crawl_service:
                     _crawl_service.start(mode="incremental", group_id=cid)
             except Exception as e:
-                logger.warning("Auto-poll crawl start failed: %s", e)
+                logger.warning("Auto-poll crawl start failed", extra={"chat_id": cid, "error": str(e)})
             push_sse_event("auto_poll_tick", {
                 "chat_id": cid,
                 "name": s.get("name"),
@@ -1786,4 +1789,17 @@ def health_check():
     }
     code = 503 if overall == "down" else 200
     return jsonify(payload), code
+
+
+@api.route("/metrics", methods=["GET"])
+def prometheus_metrics():
+    """Prometheus text-format exposition endpoint for scraping.
+
+    No auth: Prometheus scrapers must reach this without a token. Mirrors
+    the /health policy. Returns ``text/plain; version=0.0.4`` per the
+    Prometheus exposition spec.
+    """
+    from tgwatcher.web.metrics import collect_metrics
+
+    return Response(collect_metrics(), mimetype="text/plain; version=0.0.4")
 
