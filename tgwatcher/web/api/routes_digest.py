@@ -10,7 +10,7 @@ import threading
 
 from flask import Blueprint, jsonify, request
 
-from ._legacy import _app_state, _signal_engine, require_auth
+from ._legacy import _app_state, require_auth
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ def generate_digest():
     _storage = _app_state.storage
     if not _storage:
         return jsonify({"error": "Storage not initialized"}), 500
+    _signal_engine = _app_state.signal_engine
     if not _signal_engine or not getattr(_signal_engine, "_llm", None):
         return jsonify({"error": "Signal engine / LLM not initialized"}), 500
 

@@ -430,13 +430,13 @@ def export_signals():
                     "msg_id": r["message_id"],
                     "ts": ts_val,
                     "symbols": symbols_json,
-                    "direction": r.get("direction", 0.0) or 0.0,
-                    "magnitude": r.get("magnitude", 0.1) or 0.1,
-                    "urgency": r.get("urgency", 0.1) or 0.1,
-                    "confidence": r.get("confidence", 0.9) or 0.9,
-                    "halflife_min": r.get("halflife_min", 60) or 60,
-                    "event_type": r.get("event_type", "other") or "other",
-                    "reasoning": r.get("reasoning", "") or "",
+                    "direction": r.get("direction", 0.0) if r.get("direction") is not None else 0.0,
+                    "magnitude": r.get("magnitude", 0.1) if r.get("magnitude") is not None else 0.1,
+                    "urgency": r.get("urgency", 0.1) if r.get("urgency") is not None else 0.1,
+                    "confidence": r.get("confidence", 0.9) if r.get("confidence") is not None else 0.9,
+                    "halflife_min": r.get("halflife_min", 60) if r.get("halflife_min") is not None else 60,
+                    "event_type": r.get("event_type") or "other",
+                    "reasoning": r.get("reasoning") or "",
                 })
             c.commit()
         eng.dispose()
