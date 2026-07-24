@@ -63,16 +63,24 @@ from ._legacy import (  # noqa: F401
 from .routes_auth import bp as auth_bp
 from .routes_config import bp as config_bp
 from .routes_crawl import bp as crawl_bp
+from .routes_digest import bp as digest_bp
+from .routes_listen import bp as listen_bp
 from .routes_messages import bp as messages_bp
 from .routes_signals import bp as signals_bp
+from .routes_sse import bp as sse_bp
 from .routes_stats import bp as stats_bp
+from .routes_webhook import bp as webhook_bp
 
 api.register_blueprint(auth_bp)
 api.register_blueprint(config_bp)
 api.register_blueprint(crawl_bp)
+api.register_blueprint(digest_bp)
+api.register_blueprint(listen_bp)
 api.register_blueprint(messages_bp)
 api.register_blueprint(signals_bp)
+api.register_blueprint(sse_bp)
 api.register_blueprint(stats_bp)
+api.register_blueprint(webhook_bp)
 
 
 _APP_STATE_FORWARDED = frozenset({

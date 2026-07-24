@@ -375,42 +375,8 @@ def _atomic_write_config(config: dict, config_path: str) -> None:
 # (Phase 2B batch 4).
 
 
-@api.route("/listen/status", methods=["GET"])
-@require_auth
-def get_listen_status():
-    """Return current listener state: enabled (running), groups being listened to."""
-    listen_groups = _get_listen_groups(_config)
-    return jsonify({
-        "enabled": _listener_daemon.is_running,
-        "groups": [{"chat_id": g.get("id"), "name": g.get("name", g.get("id"))} for g in listen_groups],
-    })
-
-
-@api.route("/listen/status", methods=["PATCH"])
-@require_auth
-def patch_listen_status():
-    """Start or stop the listener manually.
-    Body: {"enabled": true/false}. When starting, uses all groups with auto_listen=true.
-    If no groups have auto_listen=true, returns 400."""
-    data = request.get_json(silent=True) or {}
-    enabled = data.get("enabled")
-    if enabled is None:
-        return jsonify({"error": "Missing 'enabled' in body"}), 400
-    if enabled:
-        listen_groups = _get_listen_groups(_config)
-        if not listen_groups:
-            return jsonify({"error": "No groups with auto_listen=true. Enable auto_listen on at least one group first."}), 400
-        if _listener_daemon.is_running:
-            return jsonify({"status": "already_running", "groups": [g.get("name") for g in listen_groups]})
-        ok = _start_listener_thread(listen_groups)
-        if not ok:
-            return jsonify({"error": "Failed to start listener (check logs)"}), 500
-        return jsonify({"status": "started", "groups": [g.get("name") for g in listen_groups]})
-    else:
-        if not _listener_daemon.is_running:
-            return jsonify({"status": "already_stopped"})
-        _stop_listener()
-        return jsonify({"status": "stopping"})
+# NOTE: /listen/status GET, /listen/status PATCH moved to .routes_listen
+# sub-blueprint (Phase 2B batch 5).
 
 
 # --- Telegram Dialog API ---
@@ -428,52 +394,7 @@ def get_dialogs():
 
 
 # --- SSE Endpoint ---
-
-@api.route("/events", methods=["GET"])
-def sse_stream():
-    # Prefer Authorization header (browsers' EventSource can't set headers, but
-    # our fetch-based client can). Fallback to query string for backward compat
-    # — deprecated, will be removed in schema v9.
-    token = _extract_auth_token()
-    if _auth_token and token != _auth_token:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    # Last-Event-ID reconnect compensation: browsers automatically send this
-    # header on reconnect after a dropped connection. If present, replay all
-    # buffered events with id > last_id. If absent (fresh connection), start
-    # from current max to avoid flooding new clients with history.
-    last_id_str = request.headers.get("Last-Event-ID")
-    last_id = int(last_id_str) if (last_id_str and last_id_str.isdigit()) else 0
-
-    listener_event, last_id = _sse_bus.register_listener(last_id)
-
-    def generate():
-        nonlocal last_id
-        try:
-            while True:
-                listener_event.wait(timeout=30)
-                listener_event.clear()
-                new_events = _sse_bus.events_since(last_id)
-                if new_events:
-                    last_id = new_events[-1]["id"]
-                for event in new_events:
-                    yield f"id: {event['id']}\nevent: {event['type']}\ndata: {json.dumps(event['data'], default=str)}\n\n"
-                # Keep event list bounded (secondary check)
-                _sse_bus.trim_if_needed()
-        except GeneratorExit:
-            pass
-        finally:
-            _sse_bus.unregister_listener(listener_event)
-
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+# NOTE: /events moved to .routes_sse sub-blueprint (Phase 2B batch 5).
 
 
 # --- Login API ---
@@ -490,87 +411,13 @@ def sse_stream():
 
 
 # ===== Webhook management =====
-
-@api.route("/webhook/config", methods=["GET"])
-@require_auth
-def get_webhook_config():
-    """Return current webhook dispatcher status (secrets never exposed)."""
-    if not _webhook_dispatcher:
-        return jsonify({"enabled": False, "endpoints": []})
-    return jsonify(_webhook_dispatcher.get_status())
-
-
-@api.route("/webhook/test", methods=["POST"])
-@require_auth
-def test_webhook():
-    """Send a test payload to all enabled webhook endpoints (or a specific url)."""
-    if not _webhook_dispatcher:
-        return jsonify({"error": "Webhook not initialized"}), 500
-    data = request.get_json(silent=True) or {}
-    target_url = data.get("url")
-    result = _webhook_dispatcher.send_test(target_url)
-    return jsonify(result)
+# NOTE: /webhook/config, /webhook/test moved to .routes_webhook
+# sub-blueprint (Phase 2B batch 5).
 
 
 # ===== Market digest (AI-generated summary for the user, not Selene) =====
-
-import threading as _threading
-_digest_lock = _threading.Lock()
-
-
-@api.route("/digest/generate", methods=["POST"])
-@require_auth
-def generate_digest():
-    """Generate a new market digest. Covers last window (cold start 36h, else
-    last_digest_at → now, capped at 36h). Persists to digests table.
-
-    Concurrency: module-level Lock — only one generation at a time. If a
-    request is already running, returns 409.
-    """
-    if not _storage:
-        return jsonify({"error": "Storage not initialized"}), 500
-    if not _signal_engine or not getattr(_signal_engine, "_llm", None):
-        return jsonify({"error": "Signal engine / LLM not initialized"}), 500
-
-    if not _digest_lock.acquire(blocking=False):
-        return jsonify({"error": "Another digest generation is in progress"}), 409
-
-    try:
-        from tgwatcher.digest import generate_digest as _gen
-        try:
-            result = _gen(_storage, _signal_engine._llm)
-        except Exception as e:
-            logger.exception("Digest generation failed")
-            return jsonify({"error": f"Generation failed: {e}"}), 500
-        return jsonify(result.to_dict())
-    finally:
-        _digest_lock.release()
-
-
-@api.route("/digest/latest", methods=["GET"])
-@require_auth
-def get_latest_digest():
-    """Return most recent digest (does NOT trigger LLM)."""
-    if not _storage:
-        return jsonify({"error": "Storage not initialized"}), 500
-    from tgwatcher.digest import get_latest_digest as _get
-    result = _get(_storage)
-    if result is None:
-        return jsonify(None), 404
-    return jsonify(result.to_dict())
-
-
-@api.route("/digest/history", methods=["GET"])
-@require_auth
-def list_digests():
-    """Return recent digests, newest first. ?limit=N (default 20, max 100)."""
-    if not _storage:
-        return jsonify({"error": "Storage not initialized"}), 500
-    limit = request.args.get("limit", type=int, default=20)
-    limit = max(1, min(limit, 100))
-    from tgwatcher.digest import list_digests as _list
-    rows = _list(_storage, limit=limit)
-    return jsonify([r.to_dict() for r in rows])
+# NOTE: /digest/generate, /digest/latest, /digest/history moved to
+# .routes_digest sub-blueprint (Phase 2B batch 5).
 
 
 @api.route("/health", methods=["GET"])
