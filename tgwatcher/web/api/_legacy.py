@@ -380,17 +380,7 @@ def _atomic_write_config(config: dict, config_path: str) -> None:
 
 
 # --- Telegram Dialog API ---
-
-@api.route("/dialogs", methods=["GET"])
-@require_auth
-def get_dialogs():
-    try:
-        with _tg_client_guard() as tg:
-            dialogs = _run_coro(tg.list_dialogs())
-            return jsonify(dialogs)
-    except Exception as e:
-        logger.error("Dialogs error: %s", e, exc_info=True)
-        return jsonify({"error": str(e)}), 500
+# NOTE: /dialogs moved to .routes_health sub-blueprint (Phase 2B batch 6).
 
 
 # --- SSE Endpoint ---
@@ -420,54 +410,9 @@ def get_dialogs():
 # .routes_digest sub-blueprint (Phase 2B batch 5).
 
 
-@api.route("/health", methods=["GET"])
-def health_check():
-    """Lightweight service health endpoint for Docker/k8s probes.
-
-    No auth: liveness/readiness probes must work without a token. Does NOT
-    hit the DB or TG network — only verifies module-level singletons are
-    populated. Returns 200 for ok/degraded, 503 for down.
-    """
-    storage_status = "ok" if _storage is not None else "down"
-
-    if _signal_engine is not None and getattr(_signal_engine, "_llm", None) is not None:
-        llm_status = "ok"
-    elif _signal_engine is None:
-        llm_status = "disabled"
-    else:
-        llm_status = "down"
-
-    tg_status = "ok" if _tg_client is not None else "unknown"
-
-    if storage_status == "down":
-        overall = "down"
-    elif llm_status == "down":
-        overall = "degraded"
-    else:
-        overall = "ok"
-
-    payload = {
-        "status": overall,
-        "storage": storage_status,
-        "llm": llm_status,
-        "tg_client": tg_status,
-        "timestamp": _iso_z(datetime.now(timezone.utc)),
-    }
-    code = 503 if overall == "down" else 200
-    return jsonify(payload), code
-
-
-@api.route("/metrics", methods=["GET"])
-def prometheus_metrics():
-    """Prometheus text-format exposition endpoint for scraping.
-
-    No auth: Prometheus scrapers must reach this without a token. Mirrors
-    the /health policy. Returns ``text/plain; version=0.0.4`` per the
-    Prometheus exposition spec.
-    """
-    from tgwatcher.web.metrics import collect_metrics
-
-    return Response(collect_metrics(), mimetype="text/plain; version=0.0.4")
+# --- Service Health & Metrics ---
+# NOTE: /dialogs, /health, /metrics moved to .routes_health sub-blueprint
+# (Phase 2B batch 6 — final batch).
 
 
 # ── PEP 562 module-level forwarding for the 11 AppState globals ─────────
