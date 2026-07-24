@@ -4,18 +4,11 @@ These are pure functions, simple state, and small context-managers /
 decorators that do not depend on any module-level singleton from
 `._legacy`. Dependencies on AppState (`_app_state`, `_auth_token`,
 `_async_loop`, `_tg_lock`) are resolved lazily inside each function body
-via `from tgwatcher.web.api import ...` — this avoids circular imports
-because the package's `__init__.py` runs to completion before any caller
-invokes these helpers.
-
-PEP 562 note: the package (`tgwatcher.web.api`) and `._legacy` both
-implement `__getattr__` to forward reads of the 11 `_APP_STATE_FORWARDED`
-names (including `_auth_token`, `_async_loop`, `_tg_lock`) to
-`_app_state`. The lazy `from tgwatcher.web.api import _auth_token` form
-triggers that forwarding, so mutations made by `init_services` / tests
-(``api_mod._auth_token = 't'``) are visible here. Bare-name global
-lookup inside *this* module would NOT trigger PEP 562 (it consults this
-module's `__dict__` directly), so we always re-import at call time.
+via `from tgwatcher.web.api import _app_state` — this reads the real
+module attribute (a singleton), not a PEP 562 forwarded name, so no
+`__getattr__` indirection is involved. Each helper then pulls the
+specific field it needs off `_app_state` (`.auth_token`, `.async_loop`,
+`.tg_lock`, `.get_tg_client()`, etc.).
 
 Re-exported by `._legacy` so `from ._legacy import X` continues to work
 for all route modules (zero diff to routes_*).
@@ -86,19 +79,20 @@ def _check_rate_limit(key: str, max_requests: int = 5, window: int = 60) -> bool
     return True
 
 
-# ── Auth helpers (depend on _auth_token via PEP 562) ───────────────────
+# ── Auth helpers (depend on _app_state.auth_token) ─────────────────────
 def _extract_auth_token() -> str:
     """Extract bearer token from Authorization header, falling back to ?token=.
 
     Emits a deprecation warning when the query-string fallback is used (and
     auth is enforced). Returns the raw token string ("" if absent). Callers
-    perform the actual equality check against `_auth_token`.
+    perform the actual equality check against `_app_state.auth_token`.
     """
-    from tgwatcher.web.api import _auth_token  # PEP 562 → _app_state.auth_token
+    from tgwatcher.web.api import _app_state  # real module attribute (singleton)
+    auth_token = _app_state.auth_token
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if not token:
         token = request.args.get("token", "")
-        if token and _auth_token:
+        if token and auth_token:
             logger.warning("Query-string auth via ?token= is deprecated; use Authorization header")
     return token
 
@@ -106,11 +100,12 @@ def _extract_auth_token() -> str:
 def require_auth(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        from tgwatcher.web.api import _auth_token  # PEP 562 → _app_state.auth_token
-        if _auth_token is None:
+        from tgwatcher.web.api import _app_state  # real module attribute (singleton)
+        auth_token = _app_state.auth_token
+        if auth_token is None:
             return f(*args, **kwargs)
         token = _extract_auth_token()
-        if token != _auth_token:
+        if token != auth_token:
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -140,9 +135,10 @@ def _disconnect_tg_client() -> None:
 
 
 def _run_coro(coro, timeout: float = 30.0):
-    from tgwatcher.web.api import _async_loop  # PEP 562 → _app_state.async_loop
-    if _async_loop:
-        return _async_loop.run_coroutine(coro, timeout=timeout)
+    from tgwatcher.web.api import _app_state
+    async_loop = _app_state.async_loop
+    if async_loop:
+        return async_loop.run_coroutine(coro, timeout=timeout)
     import asyncio
     loop = asyncio.new_event_loop()
     try:
@@ -158,22 +154,17 @@ def _tg_client_guard():
     Prevents concurrent use of the shared TelegramClient, which is not
     thread-safe for simultaneous operations.
     """
-    # Lazy imports — PEP 562 forwards to _app_state.{tg_lock, get_tg_client,
-    # disconnect_tg_client, async_loop}. Avoids circular import.
-    from tgwatcher.web.api import (
-        _tg_lock,
-        _get_tg_client,
-        _run_coro,
-        _disconnect_tg_client,
-    )
-    _tg_lock.acquire()
+    # Lazy import — _app_state is a real module attribute (singleton),
+    # not a PEP 562 forwarded name, so this does not trigger __getattr__.
+    from tgwatcher.web.api import _app_state
+    _app_state.tg_lock.acquire()
     try:
-        tg = _get_tg_client()
+        tg = _app_state.get_tg_client()
         if tg.client is None or not tg.client.is_connected():
             _run_coro(tg.connect())
         yield tg
     except Exception:
-        _disconnect_tg_client()
+        _app_state.disconnect_tg_client()
         raise
     finally:
-        _tg_lock.release()
+        _app_state.tg_lock.release()
