@@ -11,7 +11,7 @@ module.exports = defineConfig({
   retries: 0,
   workers: 1,
   reporter: [['list'], ['html', { open: 'never' }]],  use: {
-    baseURL: 'http://localhost:5000',
+    baseURL: 'http://localhost:5800',
     trace: 'on-first-retry',
     headless: true,
   },

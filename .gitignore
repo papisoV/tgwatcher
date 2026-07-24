@@ -46,3 +46,9 @@ export_tg_factors.py
 messages_export.md
 signal_factors_detail.md
 signal_factors_report.md
+
+# Playwright artifacts
+node_modules/
+playwright-report/
+test-results/
+package-lock.json
