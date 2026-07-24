@@ -740,8 +740,6 @@ def export_messages():
 @require_auth
 def export_signals():
     """Export signal analysis results with message context."""
-    from sqlalchemy import text as sql_text
-
     fmt = request.args.get("format", "json")
     chat_id = request.args.get("chat_id", type=int)
     date_from = request.args.get("date_from", type=str)
@@ -760,71 +758,24 @@ def export_signals():
             dt_local = dt_local.replace(hour=23, minute=59, second=59, microsecond=999999)
         dt = local_to_utc(dt_local)
 
-    rows = []
-    with _storage.engine.connect() as conn:
-        where_clauses = ["m.is_deleted = 0", "m.text IS NOT NULL", "f.llm_status = 'completed'"]
-        params: dict = {}
-        if chat_id:
-            where_clauses.append("m.chat_id = :chat_id")
-            params["chat_id"] = chat_id
-        if df:
-            where_clauses.append("m.date >= :df")
-            params["df"] = df.isoformat()
-        if dt:
-            where_clauses.append("m.date <= :dt")
-            params["dt"] = dt.isoformat()
-        if event_type:
-            where_clauses.append("f.event_type = :event_type")
-            params["event_type"] = event_type
-        if direction == "bullish":
-            where_clauses.append("f.direction > 0")
-        elif direction == "bearish":
-            where_clauses.append("f.direction < 0")
-        if llm_model:
-            where_clauses.append("f.llm_model = :llm_model")
-            params["llm_model"] = llm_model
-        if is_signal == "true":
-            where_clauses.append("f.is_signal = 1")
-        elif is_signal == "false":
-            where_clauses.append("f.is_signal = 0")
+    rows = _storage.query_signals_export(
+        chat_id=chat_id,
+        date_from=df,
+        date_to=dt,
+        event_type=event_type,
+        direction=direction,
+        llm_model=llm_model,
+        is_signal=is_signal,
+        count_only=count_only,
+    )
 
-        where = " AND ".join(where_clauses)
+    if count_only:
+        return jsonify({"count": rows})
 
-        if count_only:
-            count = conn.execute(sql_text(f"""
-                SELECT COUNT(*) FROM messages m
-                INNER JOIN signal_factors f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
-                WHERE {where}
-            """), params).scalar()
-            return jsonify({"count": count})
-
-        query = f"""
-            SELECT m.message_id, m.chat_id, m.chat_title, m.sender_name,
-                   m.text, m.date,
-                   f.direction, f.magnitude, f.urgency, f.confidence,
-                   f.halflife_min, f.symbols, f.event_type, f.reasoning
-            FROM messages m
-            INNER JOIN signal_factors f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
-            WHERE {where}
-            ORDER BY m.date DESC
-        """
-        for row in conn.execute(sql_text(query), params):
-            rows.append({
-                "message_id": row.message_id,
-                "chat_id": row.chat_id,
-                "chat_title": row.chat_title,
-                "sender_name": row.sender_name,
-                "text": row.text,
-                "date": _iso_z(row.date) if isinstance(row.date, datetime) else (str(row.date) if row.date else None),
-                "direction": row.direction,
-                "magnitude": row.magnitude,
-                "urgency": row.urgency,
-                "confidence": row.confidence,
-                "halflife_min": row.halflife_min,
-                "symbols": json.loads(row.symbols) if row.symbols else [],
-                "event_type": row.event_type,
-                "reasoning": row.reasoning,
-            })
+    # Serialize date field for JSON/CSV/Markdown rendering
+    for r in rows:
+        d = r["date"]
+        r["date"] = _iso_z(d) if isinstance(d, datetime) else (str(d) if d else None)
 
     if fmt == "csv":
         import csv

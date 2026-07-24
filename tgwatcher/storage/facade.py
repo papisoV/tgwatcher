@@ -167,3 +167,21 @@ class Storage:
 
     def reset_stuck_processing(self, timeout_minutes: int = 10) -> int:
         return self._signals.reset_stuck_processing(timeout_minutes)
+
+    def query_signals_export(
+        self,
+        chat_id: int | None = None,
+        date_from=None,
+        date_to=None,
+        event_type: str | None = None,
+        direction: str | None = None,
+        llm_model: str | None = None,
+        is_signal: str | None = None,
+        count_only: bool = False,
+    ):
+        """Phase 1B: migrated raw SQL from api.py:764. See SignalRepository."""
+        return self._signals.query_signals_export(
+            chat_id=chat_id, date_from=date_from, date_to=date_to,
+            event_type=event_type, direction=direction, llm_model=llm_model,
+            is_signal=is_signal, count_only=count_only,
+        )

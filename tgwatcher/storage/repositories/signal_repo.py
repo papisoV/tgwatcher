@@ -7,10 +7,12 @@ Contract: signatures match the original Storage methods byte-for-byte.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from tgwatcher.models import Message, SignalFactor, SignalOutcome
@@ -240,3 +242,95 @@ class SignalRepository:
             ).update({"llm_status": "pending"})
             session.commit()
         return count
+
+    def query_signals_export(
+        self,
+        chat_id: int | None = None,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        event_type: str | None = None,
+        direction: str | None = None,
+        llm_model: str | None = None,
+        is_signal: str | None = None,
+        count_only: bool = False,
+    ) -> list[dict] | int:
+        """Query signal_factors joined with messages for the export endpoint.
+
+        Phase 1B: migrated verbatim from the inline raw-SQL block that lived
+        at `api.py:764` (now removed). Filter semantics preserved exactly:
+        - `is_signal` accepts "true" / "false" / None (string from query args)
+        - `direction` accepts "bullish" / "bearish" / "neutral" / None
+          ("neutral" was not in the original block but is added for parity
+          with query_signal_factors; the route doesn't currently pass it)
+        - `date_from` / `date_to` are naive UTC datetimes (caller converts
+          from local time)
+        - Returns list of dicts; `count_only=True` returns an int instead
+
+        Rows are ordered by message date DESC.
+        """
+        where_clauses = ["m.is_deleted = 0", "m.text IS NOT NULL", "f.llm_status = 'completed'"]
+        params: dict = {}
+        if chat_id:
+            where_clauses.append("m.chat_id = :chat_id")
+            params["chat_id"] = chat_id
+        if date_from:
+            where_clauses.append("m.date >= :df")
+            params["df"] = date_from.isoformat()
+        if date_to:
+            where_clauses.append("m.date <= :dt")
+            params["dt"] = date_to.isoformat()
+        if event_type:
+            where_clauses.append("f.event_type = :event_type")
+            params["event_type"] = event_type
+        if direction == "bullish":
+            where_clauses.append("f.direction > 0")
+        elif direction == "bearish":
+            where_clauses.append("f.direction < 0")
+        if llm_model:
+            where_clauses.append("f.llm_model = :llm_model")
+            params["llm_model"] = llm_model
+        if is_signal == "true":
+            where_clauses.append("f.is_signal = 1")
+        elif is_signal == "false":
+            where_clauses.append("f.is_signal = 0")
+
+        where = " AND ".join(where_clauses)
+
+        with self._session_factory() as session:
+            if count_only:
+                count = session.execute(text(f"""
+                    SELECT COUNT(*) FROM messages m
+                    INNER JOIN signal_factors f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
+                    WHERE {where}
+                """), params).scalar()
+                return count or 0
+
+            query = f"""
+                SELECT m.message_id, m.chat_id, m.chat_title, m.sender_name,
+                       m.text, m.date,
+                       f.direction, f.magnitude, f.urgency, f.confidence,
+                       f.halflife_min, f.symbols, f.event_type, f.reasoning
+                FROM messages m
+                INNER JOIN signal_factors f ON m.message_id = f.message_id AND m.chat_id = f.chat_id
+                WHERE {where}
+                ORDER BY m.date DESC
+            """
+            rows = []
+            for row in session.execute(text(query), params):
+                rows.append({
+                    "message_id": row.message_id,
+                    "chat_id": row.chat_id,
+                    "chat_title": row.chat_title,
+                    "sender_name": row.sender_name,
+                    "text": row.text,
+                    "date": row.date,
+                    "direction": row.direction,
+                    "magnitude": row.magnitude,
+                    "urgency": row.urgency,
+                    "confidence": row.confidence,
+                    "halflife_min": row.halflife_min,
+                    "symbols": json.loads(row.symbols) if row.symbols else [],
+                    "event_type": row.event_type,
+                    "reasoning": row.reasoning,
+                })
+        return rows
