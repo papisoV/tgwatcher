@@ -1,22 +1,45 @@
-// state.js — central state module (Phase 3B)
-// Plain global const (non-module) so all scripts share the same `state` object.
-// Phase 3B keeps legacy globals (authToken, API, etc.) in app.js; this object
-// is reserved for future Phase 3C migration.
-const state = {
-  API: '',
-  currentChat: null,
-  currentPage: 1,
-  pageSize: 50,
-  totalMessages: 0,
-  crawlRunning: false,
-  expandedRow: null,
-  phoneCodeHash: null,
-  allDialogs: [],
-  authToken: localStorage.getItem('tgwatcher_token') || '',
-  sseConnected: false,
-  fallBackInterval: null,
-  searchTimer: null,
-  _loginCheckPending: false,
-  _connCheckPending: false,
-  CHART_COLORS: ['#00e5ff','#00ff88','#ffb300','#a855f7','#f472b6','#60a5fa','#2dd4bf','#ff3d71'],
-};
+// state.js — cross-domain global state (Phase 3C)
+// Plain globals (non-module pattern). All scripts share these via bare names.
+// SSE-private state (sseConnected, _sseAbort, etc.) stays in sse.js.
+const API='';
+
+let currentChat=null;
+let currentPage=1;
+let pageSize=50;
+let totalMessages=0;
+let crawlRunning=false;
+let expandedRow=null;
+
+let phoneCodeHash=null;
+let allDialogs=[];
+
+let authToken=localStorage.getItem('tgwatcher_token')||'';
+
+let searchTimer=null;
+let _loginCheckPending=false;
+let _connCheckPending=false;
+
+// Messages
+let _msgReqSeq=0;
+let _msgAbort=null;
+
+// Export
+let _exportPreviewTimer=null;
+
+// Signal export
+let _signalExportPreviewTimer=null;
+
+// Dashboard charts
+let trendChart=null;
+let comparisonChart=null;
+
+// Groups view + crawl
+let autoPollState=[];
+let autoPollTimer=null;
+
+let listenerState={enabled:false,groups:[]};
+let webhookState={enabled:false,endpoints:[]};
+
+// Signal tab charts
+let signalTrendChart=null;
+let signalEventChart=null;
