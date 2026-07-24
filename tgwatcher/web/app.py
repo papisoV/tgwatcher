@@ -1,13 +1,18 @@
 """TGWatcher Web Application — Flask server with REST API and static file serving."""
 import argparse
+import logging
 import os
+import sys
 from pathlib import Path
 
 from flask import Flask, send_from_directory, Response
 
+from tgwatcher.config_schema import validate_config
 from tgwatcher.web.api import api, init_services
 from tgwatcher.web.async_loop import AsyncLoopManager
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_config_path(config_path: str | None = None) -> str:
@@ -19,10 +24,31 @@ def _resolve_config_path(config_path: str | None = None) -> str:
     return str(Path.cwd() / "config.yaml")
 
 
+def _load_config(config_path: str) -> dict:
+    """Load YAML config and run schema validation.
+
+    Hard-fails on validation errors (typos in required fields, missing keys,
+    invalid provider config). Logs warnings for suspected typos but continues.
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    errors = validate_config(config)
+    if errors:
+        for err in errors:
+            logger.error("config: %s", err)
+        print(
+            f"[FATAL] Config validation failed with {len(errors)} error(s); "
+            "see log above. Aborting.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return config
+
+
 def create_app(config_path: str | None = None) -> Flask:
     config_path = _resolve_config_path(config_path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = _load_config(config_path)
 
     from tgwatcher.tz_utils import set_tz_offset
     set_tz_offset(config.get("timezone", {}).get("utc_offset_hours", 8))

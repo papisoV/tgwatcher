@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request, Response
@@ -41,6 +41,21 @@ def _iso_z(v) -> str | None:
     if v.tzinfo is None and not s.endswith(("Z", "+00:00")):
         s = s + "Z"
     return s
+
+
+def _extract_auth_token() -> str:
+    """Extract bearer token from Authorization header, falling back to ?token=.
+
+    Emits a deprecation warning when the query-string fallback is used (and
+    auth is enforced). Returns the raw token string ("" if absent). Callers
+    perform the actual equality check against `_auth_token`.
+    """
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        token = request.args.get("token", "")
+        if token and _auth_token:
+            logger.warning("Query-string auth via ?token= is deprecated; use Authorization header")
+    return token
 
 
 _storage: Storage | None = None
@@ -131,9 +146,7 @@ def require_auth(f):
     def decorated(*args, **kwargs):
         if _auth_token is None:
             return f(*args, **kwargs)
-        token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        if not token:
-            token = request.args.get("token", "")
+        token = _extract_auth_token()
         if token != _auth_token:
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
@@ -1248,11 +1261,7 @@ def sse_stream():
     # Prefer Authorization header (browsers' EventSource can't set headers, but
     # our fetch-based client can). Fallback to query string for backward compat
     # — deprecated, will be removed in schema v9.
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if not token:
-        token = request.args.get("token", "")
-        if token and _auth_token:
-            logger.warning("SSE auth via query string is deprecated; use Authorization header")
+    token = _extract_auth_token()
     if _auth_token and token != _auth_token:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -1740,4 +1749,41 @@ def list_digests():
     from tgwatcher.digest import list_digests as _list
     rows = _list(_storage, limit=limit)
     return jsonify([r.to_dict() for r in rows])
+
+
+@api.route("/health", methods=["GET"])
+def health_check():
+    """Lightweight service health endpoint for Docker/k8s probes.
+
+    No auth: liveness/readiness probes must work without a token. Does NOT
+    hit the DB or TG network — only verifies module-level singletons are
+    populated. Returns 200 for ok/degraded, 503 for down.
+    """
+    storage_status = "ok" if _storage is not None else "down"
+
+    if _signal_engine is not None and getattr(_signal_engine, "_llm", None) is not None:
+        llm_status = "ok"
+    elif _signal_engine is None:
+        llm_status = "disabled"
+    else:
+        llm_status = "down"
+
+    tg_status = "ok" if _tg_client is not None else "unknown"
+
+    if storage_status == "down":
+        overall = "down"
+    elif llm_status == "down":
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    payload = {
+        "status": overall,
+        "storage": storage_status,
+        "llm": llm_status,
+        "tg_client": tg_status,
+        "timestamp": _iso_z(datetime.now(timezone.utc)),
+    }
+    code = 503 if overall == "down" else 200
+    return jsonify(payload), code
 
