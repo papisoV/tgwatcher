@@ -1,6 +1,8 @@
-// state.js — central state module (Phase 3A)
-// Re-exported from app.js global declarations. Phase 3B will move consumers here.
-export const state = {
+// state.js — central state module (Phase 3B)
+// Plain global const (non-module) so all scripts share the same `state` object.
+// Phase 3B keeps legacy globals (authToken, API, etc.) in app.js; this object
+// is reserved for future Phase 3C migration.
+const state = {
   API: '',
   currentChat: null,
   currentPage: 1,

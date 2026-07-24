@@ -3,44 +3,17 @@ const API='';
 let currentChat=null,currentPage=1,pageSize=50,totalMessages=0,crawlRunning=false,expandedRow=null;
 let phoneCodeHash=null,allDialogs=[];
 let authToken=localStorage.getItem('tgwatcher_token')||'';
-let sseConnected=false,fallBackInterval=null,searchTimer=null;
+let searchTimer=null;
 let _loginCheckPending=false,_connCheckPending=false;
 
-const CHART_COLORS=['#00e5ff','#00ff88','#ffb300','#a855f7','#f472b6','#60a5fa','#2dd4bf','#ff3d71'];
-
-function _isLightTheme(){return document.documentElement.getAttribute('data-theme')==='light'}
-function _chartColors(){
-  const light=_isLightTheme();
-  return{
-    grid:light?'#d5d9e0':'#1a1f2e',
-    tick:light?'#718096':'#6b7a8d',
-    legend:light?'#4a5568':'#a0aec0',
-    tooltipBg:light?'#ebedf2':'#141a26',
-    tooltipTitle:light?'#1a2030':'#e8ecf1',
-    tooltipBody:light?'#4a5568':'#a0aec0',
-    border:light?'rgba(0,0,0,.08)':'rgba(255,255,255,.06)',
-  };
-}
-function _chartOpts(){
-  const c=_chartColors();
-  return{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:c.legend,font:{family:"'Inter'",size:11},boxWidth:12}},tooltip:{backgroundColor:c.tooltipBg,titleColor:c.tooltipTitle,bodyColor:c.tooltipBody,borderColor:c.border,borderWidth:1}},interaction:{intersect:false,mode:'index'}};
-}
-function _chartScales(){
-  const c=_chartColors();
-  return{x:{grid:{color:c.grid,lineWidth:1},ticks:{color:c.tick,maxTicksLimit:10,font:{family:"'JetBrains Mono'",size:10}},border:{color:c.border}},y:{grid:{color:c.grid,lineWidth:1},ticks:{color:c.tick,font:{family:"'JetBrains Mono'",size:10}},border:{color:c.border}}};
-}
-
-async function api(path,opts={}){
-  const headers={'Content-Type':'application/json',...opts.headers};
-  if(authToken)headers['Authorization']='Bearer '+authToken;
-  try{const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),15000);
-    const r=await fetch(API+path,{headers,...opts,signal:opts.signal||ctrl.signal});clearTimeout(timer);
-    if(r.status===401){authToken='';localStorage.removeItem('tgwatcher_token');location.reload();return null}
-    return await r.json()}catch(e){if(e.name==='AbortError'&&!opts.signal)showToast('请求超时 — 请检查服务器','error');else if(e.name!=='AbortError')console.error('API error:',e);return null}
-}
-function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function fmtTime(iso){if(!iso)return'-';const d=new Date(iso+'Z');if(isNaN(d))return iso;const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'),h=String(d.getHours()).padStart(2,'0'),mi=String(d.getMinutes()).padStart(2,'0');return `${y}-${m}-${day} ${h}:${mi}`}
-function fmtTimeShort(iso){if(!iso)return'--:--';const d=new Date(iso+'Z');if(isNaN(d))return iso;return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+// CHART_COLORS, _isLightTheme, _chartColors, _chartOpts, _chartScales,
+// esc, fmtTime, fmtTimeShort, fmtChatTime, _fmtDuration → app/utils.js
+// api() → app/api-client.js
+// renderPagination, updateCrawlUI, updateCrawlDetail, refreshAutoPollUI,
+// refreshListenerBadge, refreshWebhookBadge, showToast → app/render.js
+// _parseSSE, _scheduleReconnect, connectSSE, flashNewSignal,
+// sseConnected, fallBackInterval, _sseAbort, _sseRetryIdx, _lastSSEId,
+// SSE_RETRY_DELAYS, lastSignalFlash → app/sse.js
 
 // ===== LOGIN =====
 function showLoginStep(step){for(let i=0;i<=3;i++)document.getElementById('loginStep'+i).classList.toggle('active',i===step)}
@@ -161,23 +134,6 @@ async function saveGroups(){
 }
 
 // ===== CHATS =====
-function fmtChatTime(dateStr){
-  if(!dateStr)return '';
-  // DB stores UTC; append 'Z' so the browser parses as UTC, then getHours()
-  // returns local time (consistent with fmtTime).
-  const iso=(dateStr.includes('T')?dateStr:dateStr.replace(' ','T'))+'Z';
-  const d=new Date(iso);
-  if(isNaN(d))return '';
-  const now=new Date();
-  const diff=(now-d)/1000;
-  if(diff<60)return '刚刚';
-  if(diff<3600)return Math.floor(diff/60)+'分钟前';
-  if(diff<86400)return Math.floor(diff/3600)+'小时前';
-  if(diff<86400*7)return Math.floor(diff/86400)+'天前';
-  const mm=String(d.getMonth()+1).padStart(2,'0');
-  const dd=String(d.getDate()).padStart(2,'0');
-  return `${d.getFullYear()}-${mm}-${dd}`;
-}
 async function loadChats(){
   const chats=await api('/api/chats');if(!chats)return;
   // Sort by last_msg_date desc (most recently active first), nulls last.
@@ -269,16 +225,6 @@ async function loadReply(msgId,el){
   div.style.cssText='margin-top:4px;padding:6px;background:var(--bg-0);border:1px solid var(--border);font-size:var(--fs-xs);line-height:1.5;color:var(--text-1);max-width:400px';
   div.innerHTML='<b>'+esc(r.sender_name||'?')+'</b> <span style="color:var(--text-3)">'+fmtTime(r.date)+'</span><br>'+esc(r.text||'').slice(0,300);
   el.after(div);el.onclick=()=>div.remove();
-}
-
-function renderPagination(total,page,size){
-  const pages=Math.ceil(total/size)||1;
-  document.getElementById('pageInfo').textContent=`${total} 条 · ${page}/${pages} 页`;
-  const btns=[];const start=Math.max(1,page-3);const end=Math.min(pages,page+3);
-  if(page>1)btns.push(`<span class="page-btn" onclick="loadMessages(${page-1})">‹</span>`);
-  for(let i=start;i<=end;i++)btns.push(`<span class="page-btn${i===page?' active':''}" onclick="loadMessages(${i})">${i}</span>`);
-  if(page<pages)btns.push(`<span class="page-btn" onclick="loadMessages(${page+1})">›</span>`);
-  document.getElementById('pageBtns').innerHTML=btns.join('');
 }
 
 function filterChat(chatId){
@@ -709,105 +655,7 @@ async function stopCrawl(){
 
 async function loadCrawlStatus(){const s=await api('/api/crawl/status');if(!s)return;updateCrawlUI(s)}
 
-function updateCrawlUI(s){
-  crawlRunning=s.running;
-  const dot=document.getElementById('crawlBarDot');
-  const status=document.getElementById('crawlBarStatus');
-  const modeEl=document.getElementById('crawlBarMode');
-  const detail=document.getElementById('crawlBarDetail');
-  const counts=document.getElementById('crawlBarCounts');
-  const meta=document.getElementById('crawlBarMeta');
-  const progress=document.getElementById('crawlBarProgress');
-  const btnStart=document.getElementById('btnStart');
-  const btnStop=document.getElementById('btnStop');
-
-  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围','catchup':'补爬'};
-  dot.className='crawl-bar__dot'+(s.running?' running':'')+(s.error?' error':'');
-  if(s.running){
-    status.textContent='爬取中';
-    modeEl.textContent=modeLabels[s.mode]||s.mode;modeEl.style.display='';
-    btnStart.style.display='none';btnStop.style.display='';
-    hideDateRangePanel();
-
-    const totalGroups=s.total_groups||1;
-    const completedGroups=s.completed_groups||0;
-    const groupIdx=s.current_group_index||0;
-    const pct=Math.round(((completedGroups)+(s.current_group_fetched?0.5:0))/totalGroups*100);
-    progress.style.width=Math.min(pct,100)+'%';
-    progress.classList.add('running');
-
-    // Detail: group progress
-    const groupProgress=groupIdx>0?`[${groupIdx}/${totalGroups}] `:'';
-    detail.textContent=groupProgress+(s.current_group||'—');
-
-    // Counts: fetched/saved + per-group
-    const totalFetched=s.total_fetched||0;
-    const totalSaved=s.total_saved||0;
-    const gf=s.current_group_fetched||0;
-    const gs=s.current_group_saved||0;
-    let countsText=`↑${totalFetched} ↓${totalSaved}`;
-    if(gf>0)countsText+=`  (本组: ${gs}/${gf})`;
-    counts.textContent=countsText;
-
-    // Meta: speed + elapsed + ETA
-    const speed=s.speed||0;
-    const elapsed=s.elapsed_seconds||0;
-    const eta=s.eta_seconds||0;
-    const parts=[];
-    if(elapsed>0)parts.push(_fmtDuration(elapsed));
-    if(speed>0)parts.push(`${speed}条/分`);
-    if(eta>0)parts.push('剩余'+_fmtDuration(eta));
-    meta.textContent=parts.join(' · ');
-
-    // Update detail panel
-    updateCrawlDetail(s);
-  }else{
-    status.textContent=s.error?'错误':'空闲';
-    modeEl.style.display='';btnStart.style.display='';btnStop.style.display='none';
-    progress.style.width='0%';progress.classList.remove('running');
-    if(s.error)detail.textContent='错误: '+s.error.slice(0,60);
-    else if(s.last_crawl_at)detail.textContent='上次: '+fmtTime(s.last_crawl_at);
-    else detail.textContent='暂无爬取数据';
-    counts.textContent='';
-    meta.textContent='';
-
-    // Hide detail panel when crawl stops
-    const dp=document.getElementById('crawlDetail');
-    if(dp.style.display!=='none')updateCrawlDetail(s);
-  }
-  const connDot=document.getElementById('connDot');
-  connDot.className='conn-dot'+(s.running?' running':'');
-  const topDot=document.getElementById('crawlTopDot');
-  if(topDot)topDot.className='conn-dot'+(s.running?' running':'')+(s.error?' error':'');
-  const topStatus=document.getElementById('crawlTopStatus');
-  if(topStatus)topStatus.textContent=status.textContent;
-  const topMode=document.getElementById('crawlTopMode');
-  if(topMode){topMode.textContent=modeEl.textContent;topMode.style.display=modeEl.style.display}
-}
-
-function updateCrawlDetail(s){
-  const modeLabels={'incremental':'增量','full':'全量','date_range':'日期范围','catchup':'补爬','idle':'—'};
-  document.getElementById('cdKpiMode').textContent=modeLabels[s.mode]||s.mode||'—';
-  const gi=s.current_group_index||0,tg=s.total_groups||0;
-  document.getElementById('cdKpiGroup').textContent=gi>0?`${gi}/${tg}`:'—';
-  document.getElementById('cdKpiFetched').textContent=(s.total_fetched||0).toLocaleString();
-  document.getElementById('cdKpiSaved').textContent=(s.total_saved||0).toLocaleString();
-  const speed=s.speed||0;
-  document.getElementById('cdKpiSpeed').textContent=speed>0?speed+'条/分':'—';
-  document.getElementById('cdKpiElapsed').textContent=s.elapsed_seconds>0?_fmtDuration(s.elapsed_seconds):'—';
-  document.getElementById('cdKpiEta').textContent=s.eta_seconds>0?_fmtDuration(s.eta_seconds):'—';
-
-  const totalGroups=s.total_groups||1;
-  const completed=s.completed_groups||0;
-  const gf=s.current_group_fetched||0;
-  const pct=Math.round((completed+(gf?0.5:0))/totalGroups*100);
-  document.getElementById('cdProgressFill').style.width=Math.min(pct,100)+'%';
-  document.getElementById('cdProgressPct').textContent=Math.min(pct,100)+'%';
-
-  document.getElementById('cdCurrentGroup').textContent=s.current_group||'—';
-  const gf2=s.current_group_fetched||0,gs2=s.current_group_saved||0;
-  document.getElementById('cdCurrentCounts').textContent=gf2>0?`拉取 ${gf2} · 保存 ${gs2}`:'';
-}
+// updateCrawlUI, updateCrawlDetail → app/render.js
 
 function toggleCrawlDetail(){
   const dp=document.getElementById('crawlDetail');
@@ -819,80 +667,17 @@ function toggleCrawlDetail(){
   }
 }
 
-function _fmtDuration(sec){
-  if(sec<60)return sec+'秒';
-  if(sec<3600)return Math.floor(sec/60)+'分'+(sec%60?sec%60+'秒':'');
-  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);
-  return h+'时'+(m?m+'分':'');
-}
+// _fmtDuration → app/utils.js
 
 // ===== SSE =====
+// _parseSSE, _scheduleReconnect, connectSSE, flashNewSignal,
+// sseConnected, fallBackInterval, _sseAbort, _sseRetryIdx, _lastSSEId,
+// SSE_RETRY_DELAYS, lastSignalFlash → app/sse.js
 let autoPollState=[];let autoPollTimer=null;
-let _sseAbort=null,_sseRetryIdx=0,_lastSSEId=0;
-const SSE_RETRY_DELAYS=[1000,2000,4000,8000,15000];
 
-function _parseSSE(raw){
-  const evt={};const dataLines=[];
-  raw.split('\n').forEach(line=>{
-    if(line.startsWith('event:'))evt.event=line.slice(6).trim();
-    else if(line.startsWith('data:'))dataLines.push(line.slice(5).replace(/^ /,''));
-    else if(line.startsWith('id:')){const id=parseInt(line.slice(3).trim());if(!isNaN(id))evt.id=id}
-  });
-  evt.data=dataLines.join('\n');
-  return evt;
-}
+// _parseSSE → app/sse.js
 
-function _scheduleReconnect(){
-  sseConnected=false;
-  if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);
-  const delay=SSE_RETRY_DELAYS[Math.min(_sseRetryIdx,SSE_RETRY_DELAYS.length-1)];
-  _sseRetryIdx++;
-  console.warn('[SSE] reconnect in',delay,'ms (attempt',_sseRetryIdx,')');
-  setTimeout(()=>{connectSSE()},delay);
-}
-
-function connectSSE(){
-  if(!authToken)return;
-  if(_sseAbort){_sseAbort.abort();_sseAbort=null}
-  const ctrl=new AbortController();_sseAbort=ctrl;
-  const headers={'Authorization':'Bearer '+authToken};
-  if(_lastSSEId>0)headers['Last-Event-ID']=String(_lastSSEId);
-  fetch(API+'/api/events',{headers,signal:ctrl.signal})
-    .then(r=>{
-      if(!r.ok)throw new Error('SSE HTTP '+r.status);
-      sseConnected=true;_sseRetryIdx=0;
-      if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null}
-      loadAutoPollState();loadListenState();loadWebhookState();
-      const reader=r.body.getReader();
-      const dec=new TextDecoder();
-      let buf='';
-      const handlers={
-        crawl_status:e=>updateCrawlUI(JSON.parse(e.data)),
-        new_messages:e=>{if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage)},
-        crawl_error:e=>{showToast(e.data,'error')},
-        signal_process_status:e=>{checkSignalStatus()},
-        auto_poll_tick:e=>{try{JSON.parse(e.data);refreshAutoPollUI()}catch(_){}},
-        listener_status:e=>{try{refreshListenerBadge(JSON.parse(e.data))}catch(_){}},
-        new_signal:e=>{try{flashNewSignal(JSON.parse(e.data))}catch(_){}},
-        webhook_status:e=>{try{refreshWebhookBadge(JSON.parse(e.data))}catch(_){}}
-      };
-      function pump(){
-        reader.read().then(({done,value})=>{
-          if(done){_scheduleReconnect();return}
-          buf+=dec.decode(value,{stream:true});
-          let idx;
-          while((idx=buf.indexOf('\n\n'))>=0){
-            const raw=buf.slice(0,idx);buf=buf.slice(idx+2);
-            const evt=_parseSSE(raw);
-            if(evt.id&&evt.id>_lastSSEId)_lastSSEId=evt.id;
-            if(evt.event&&handlers[evt.event]){try{handlers[evt.event](evt)}catch(err){console.error('[SSE] handler error',evt.event,err)}}
-          }
-          pump();
-        }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()});
-      }
-      pump();
-    }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()});
-}
+// _scheduleReconnect, connectSSE → app/sse.js
 
 // ===== AUTO POLL =====
 async function loadAutoPollState(){
@@ -901,32 +686,10 @@ async function loadAutoPollState(){
   if(!autoPollTimer)autoPollTimer=setInterval(refreshAutoPollUI,1000);
 }
 
-function refreshAutoPollUI(){
-  const el=document.getElementById('autoPollNext');if(!el)return;
-  const active=autoPollState.filter(s=>s.enabled);
-  if(active.length===0){el.style.display='none';return}
-  // pick the soonest-expiring one
-  const next=active.reduce((a,b)=>(a.remaining_seconds||0)<(b.remaining_seconds||0)?a:b);
-  el.style.display='inline';
-  const sec=Math.max(0,Math.floor(next.remaining_seconds||0));
-  el.textContent='⟳ '+next.name+' '+sec+'s';
-}
+// refreshAutoPollUI → app/render.js
 
 let listenerState={enabled:false,groups:[]};
-function refreshListenerBadge(d){
-  if(d)listenerState=d;
-  const el=document.getElementById('listenerBadge');if(!el)return;
-  if(listenerState.enabled){
-    const names=listenerState.groups||[];
-    el.style.display='inline';
-    el.style.color='var(--green)';
-    el.textContent='● 实时监听 '+(names.length?names.map(g=>g.name||g).join(', '):'');
-  }else{
-    el.style.display='inline';
-    el.style.color='var(--text-2)';
-    el.textContent='○ 实时监听 关';
-  }
-}
+// refreshListenerBadge → app/render.js
 async function loadListenState(){
   const r=await api('/api/listen/status');if(!r)return;
   listenerState=r;refreshListenerBadge();
@@ -934,43 +697,12 @@ async function loadListenState(){
 
 // ===== WEBHOOK + NEW_SIGNAL =====
 let webhookState={enabled:false,endpoints:[]};
-function refreshWebhookBadge(d){
-  if(d&&d.url){
-    // Failure event from SSE
-    const el=document.getElementById('webhookBadge');if(!el)return;
-    el.style.display='inline';
-    el.style.color='var(--red)';
-    el.textContent='✗ Webhook '+d.url+' 失败 x'+(d.fail_count||1);
-    return;
-  }
-  const el=document.getElementById('webhookBadge');if(!el)return;
-  if(webhookState.enabled){
-    el.style.display='inline';
-    el.style.color='var(--cyan)';
-    const ok=(webhookState.endpoints||[]).filter(e=>e.enabled).length;
-    el.textContent='↪ Webhook '+ok+' 端点';
-  }else{
-    el.style.display='none';
-  }
-}
+// refreshWebhookBadge → app/render.js
 async function loadWebhookState(){
   const r=await api('/api/webhook/config');if(!r)return;
   webhookState=r;refreshWebhookBadge();
 }
-let lastSignalFlash=null;
-function flashNewSignal(d){
-  const el=document.getElementById('newSignalBadge');if(!el)return;
-  const dir=d.direction>0?'▲ 利好':d.direction<0?'▼ 利空':'— 中性';
-  const sym=(d.symbols||[]).slice(0,3).join('/')||'?';
-  const score=d.signal_score!=null?((d.signal_score>=0?'+':'')+Number(d.signal_score).toFixed(3)):'';
-  const scoreColor=d.signal_score>0.05?'#00ff88':d.signal_score<-0.05?'#ff3d71':'#a0aec0';
-  const scoreHtml=score?` <span style="color:${scoreColor};font-weight:600">${score}</span>`:'';
-  el.style.display='inline';
-  el.textContent='⚡ '+dir+' '+sym+' '+(d.confidence?(d.confidence*100).toFixed(0)+'%':'');
-  if(scoreHtml){el.insertAdjacentHTML('beforeend',scoreHtml)}
-  if(lastSignalFlash)clearTimeout(lastSignalFlash);
-  lastSignalFlash=setTimeout(()=>{el.style.display='none'},8000);
-}
+// flashNewSignal → app/sse.js
 async function testWebhook(){
   const r=await api('/api/webhook/test',{method:'POST',body:JSON.stringify({})});
   if(!r)return;
@@ -1029,10 +761,7 @@ async function updateAutoPoll(chat_id,field,value){
 }
 
 // ===== TOAST =====
-function showToast(msg,type='info'){
-  const t=document.createElement('div');t.className='toast toast-'+type;t.textContent=msg;
-  document.body.appendChild(t);setTimeout(()=>t.remove(),5000);
-}
+// showToast → app/render.js
 
 // ===== PANEL =====
 function togglePanel(){

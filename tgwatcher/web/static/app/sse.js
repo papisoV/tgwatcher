@@ -1,0 +1,90 @@
+// sse.js — Server-Sent Events client (Phase 3B)
+// Extracted from app.js. Non-module: functions are global.
+// Dependencies (resolved at call time):
+//   - authToken, API (app.js globals)
+//   - loadCrawlStatus, loadMessages, currentChat, currentPage (app.js)
+//   - loadAutoPollState, loadListenState, loadWebhookState (app.js)
+//   - updateCrawlUI, refreshAutoPollUI, refreshListenerBadge,
+//     refreshWebhookBadge, showToast, checkSignalStatus (render.js / app.js)
+
+let sseConnected=false,fallBackInterval=null;
+let _sseAbort=null,_sseRetryIdx=0,_lastSSEId=0;
+const SSE_RETRY_DELAYS=[1000,2000,4000,8000,15000];
+let lastSignalFlash=null;
+
+function _parseSSE(raw){
+  const evt={};const dataLines=[];
+  raw.split('\n').forEach(line=>{
+    if(line.startsWith('event:'))evt.event=line.slice(6).trim();
+    else if(line.startsWith('data:'))dataLines.push(line.slice(5).replace(/^ /,''));
+    else if(line.startsWith('id:')){const id=parseInt(line.slice(3).trim());if(!isNaN(id))evt.id=id}
+  });
+  evt.data=dataLines.join('\n');
+  return evt;
+}
+
+function _scheduleReconnect(){
+  sseConnected=false;
+  if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);
+  const delay=SSE_RETRY_DELAYS[Math.min(_sseRetryIdx,SSE_RETRY_DELAYS.length-1)];
+  _sseRetryIdx++;
+  console.warn('[SSE] reconnect in',delay,'ms (attempt',_sseRetryIdx,')');
+  setTimeout(()=>{connectSSE()},delay);
+}
+
+function connectSSE(){
+  if(!authToken)return;
+  if(_sseAbort){_sseAbort.abort();_sseAbort=null}
+  const ctrl=new AbortController();_sseAbort=ctrl;
+  const headers={'Authorization':'Bearer '+authToken};
+  if(_lastSSEId>0)headers['Last-Event-ID']=String(_lastSSEId);
+  fetch(API+'/api/events',{headers,signal:ctrl.signal})
+    .then(r=>{
+      if(!r.ok)throw new Error('SSE HTTP '+r.status);
+      sseConnected=true;_sseRetryIdx=0;
+      if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null}
+      loadAutoPollState();loadListenState();loadWebhookState();
+      const reader=r.body.getReader();
+      const dec=new TextDecoder();
+      let buf='';
+      const handlers={
+        crawl_status:e=>updateCrawlUI(JSON.parse(e.data)),
+        new_messages:e=>{if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage)},
+        crawl_error:e=>{showToast(e.data,'error')},
+        signal_process_status:e=>{checkSignalStatus()},
+        auto_poll_tick:e=>{try{JSON.parse(e.data);refreshAutoPollUI()}catch(_){}},
+        listener_status:e=>{try{refreshListenerBadge(JSON.parse(e.data))}catch(_){}},
+        new_signal:e=>{try{flashNewSignal(JSON.parse(e.data))}catch(_){}},
+        webhook_status:e=>{try{refreshWebhookBadge(JSON.parse(e.data))}catch(_){}}
+      };
+      function pump(){
+        reader.read().then(({done,value})=>{
+          if(done){_scheduleReconnect();return}
+          buf+=dec.decode(value,{stream:true});
+          let idx;
+          while((idx=buf.indexOf('\n\n'))>=0){
+            const raw=buf.slice(0,idx);buf=buf.slice(idx+2);
+            const evt=_parseSSE(raw);
+            if(evt.id&&evt.id>_lastSSEId)_lastSSEId=evt.id;
+            if(evt.event&&handlers[evt.event]){try{handlers[evt.event](evt)}catch(err){console.error('[SSE] handler error',evt.event,err)}}
+          }
+          pump();
+        }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()})
+      }
+      pump();
+    }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()})
+}
+
+function flashNewSignal(d){
+  const el=document.getElementById('newSignalBadge');if(!el)return;
+  const dir=d.direction>0?'▲ 利好':d.direction<0?'▼ 利空':'— 中性';
+  const sym=(d.symbols||[]).slice(0,3).join('/')||'?';
+  const score=d.signal_score!=null?((d.signal_score>=0?'+':'')+Number(d.signal_score).toFixed(3)):'';
+  const scoreColor=d.signal_score>0.05?'#00ff88':d.signal_score<-0.05?'#ff3d71':'#a0aec0';
+  const scoreHtml=score?` <span style="color:${scoreColor};font-weight:600">${score}</span>`:'';
+  el.style.display='inline';
+  el.textContent='⚡ '+dir+' '+sym+' '+(d.confidence?(d.confidence*100).toFixed(0)+'%':'');
+  if(scoreHtml){el.insertAdjacentHTML('beforeend',scoreHtml)}
+  if(lastSignalFlash)clearTimeout(lastSignalFlash);
+  lastSignalFlash=setTimeout(()=>{el.style.display='none'},8000);
+}
