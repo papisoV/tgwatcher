@@ -19,7 +19,7 @@ from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class MigrationRunner:
@@ -62,6 +62,8 @@ class MigrationRunner:
             self._migrate_v6_to_v7()
         if from_version < 8:
             self._migrate_v7_to_v8()
+        if from_version < 9:
+            self._migrate_v8_to_v9()
         logger.info(
             "Schema migration complete",
             extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_complete"},
@@ -166,3 +168,40 @@ class MigrationRunner:
         Base.metadata.create_all(self.engine, tables=[Digest.__table__])
         self.set_schema_version(8)
         logger.info("Migration v7 -> v8 complete")
+
+    def _migrate_v8_to_v9(self) -> None:
+        """Add composite indexes for N+1 query hot paths.
+
+        - `ix_messages_sender_id_is_deleted`: supports get_senders() GROUP BY
+          and loadSenders filter (was scanning ix_messages_is_deleted and
+          filtering sender_id in Python).
+        - `ix_messages_chat_id_is_deleted`: supports get_chats() per-chat
+          COUNT/MAX after the GROUP BY rewrite — composite covers
+          (chat_id, is_deleted) lookups more efficiently than the existing
+          single-column ix_messages_chat_id.
+        - `ix_signal_factors_chat_id_created_at`: supports trend queries
+          ordered by created_at within a chat.
+        - `ix_signal_outcomes_message_id`: supports outcome lookup by
+          message_id (currently only chat_id is indexed).
+        """
+        logger.info("Migrating schema v8 -> v9 (N+1 query indexes) ...")
+        with self.engine.connect() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_messages_sender_id_is_deleted "
+                "ON messages (sender_id, is_deleted)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_messages_chat_id_is_deleted "
+                "ON messages (chat_id, is_deleted)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_signal_factors_chat_id_created_at "
+                "ON signal_factors (chat_id, created_at)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_signal_outcomes_message_id "
+                "ON signal_outcomes (message_id)"
+            ))
+            conn.commit()
+        self.set_schema_version(9)
+        logger.info("Migration v8 -> v9 complete")

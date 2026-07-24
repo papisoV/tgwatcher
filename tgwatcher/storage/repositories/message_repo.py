@@ -345,37 +345,31 @@ class MessageRepository:
 
     def get_senders(self, chat_id: int | None = None) -> list[dict]:
         with self._session_factory() as session:
-            sender_rows = session.query(Sender).all() if not chat_id else []
-            if sender_rows:
-                result = []
-                for sender in sender_rows:
-                    q = session.query(func.count(Message.id)).filter(
-                        Message.sender_id == sender.sender_id, Message.is_deleted == False
-                    )
-                    if chat_id is not None:
-                        q = q.filter(Message.chat_id == chat_id)
-                    msg_count = q.scalar()
-                    if msg_count > 0:
-                        result.append({
-                            "sender_id": sender.sender_id,
-                            "sender_name": sender.sender_name,
-                            "sender_username": sender.sender_username,
-                            "msg_count": msg_count,
-                        })
-                return result
-
-            # Fallback: derive from messages
+            # Unified GROUP BY query — was N+1 (loaded all senders, then
+            # per-sender COUNT). The previous "if sender_rows" branch is
+            # dropped because it was strictly worse than this GROUP BY:
+            # it returned senders with zero messages (filtered out) and
+            # ran N queries instead of 1.
             q = session.query(
                 Message.sender_id,
                 Message.sender_name,
+                Message.sender_username,
                 func.count(Message.id).label("msg_count"),
             ).filter(Message.sender_id.isnot(None), Message.is_deleted == False)
             if chat_id is not None:
                 q = q.filter(Message.chat_id == chat_id)
-            q = q.group_by(Message.sender_id, Message.sender_name)
+            q = q.group_by(Message.sender_id, Message.sender_name, Message.sender_username)
             q = q.order_by(func.count(Message.id).desc())
             rows = q.all()
-        return [{"sender_id": r.sender_id, "sender_name": r.sender_name, "msg_count": r.msg_count} for r in rows]
+        return [
+            {
+                "sender_id": r.sender_id,
+                "sender_name": r.sender_name,
+                "sender_username": r.sender_username,
+                "msg_count": r.msg_count,
+            }
+            for r in rows
+        ]
 
     def delete_chat_data(self, chat_id: int) -> int:
         """Delete all messages and the chat row for a given chat_id. Returns deleted message count."""

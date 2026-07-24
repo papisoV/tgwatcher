@@ -54,24 +54,35 @@ class ChatRepository:
         with self._session_factory() as session:
             chat_rows = session.query(Chat).all()
             if chat_rows:
-                result = []
-                for chat in chat_rows:
-                    msg_count = session.query(func.count(Message.id)).filter(
-                        Message.chat_id == chat.chat_id, Message.is_deleted == False
-                    ).scalar()
-                    last_date = session.query(func.max(Message.date)).filter(
-                        Message.chat_id == chat.chat_id
-                    ).scalar()
-                    result.append({
+                # Single GROUP BY query instead of N+1 (was: per-chat
+                # COUNT+MAX = 2N+1 queries). Uses ix_messages_chat_id_date.
+                agg_rows = (
+                    session.query(
+                        Message.chat_id,
+                        func.count(Message.id).label("msg_count"),
+                        func.max(Message.date).label("last_date"),
+                    )
+                    .filter(Message.is_deleted == False)
+                    .group_by(Message.chat_id)
+                    .all()
+                )
+                agg = {r.chat_id: (r.msg_count, r.last_date) for r in agg_rows}
+                return [
+                    {
                         "chat_id": chat.chat_id,
                         "chat_title": chat.chat_title,
                         "chat_username": chat.chat_username,
                         "chat_type": chat.chat_type,
                         "members": chat.members,
-                        "msg_count": msg_count,
-                        "last_msg_date": last_date.isoformat() if last_date else None,
-                    })
-                return result
+                        "msg_count": agg.get(chat.chat_id, (0, None))[0],
+                        "last_msg_date": (
+                            agg[chat.chat_id][1].isoformat()
+                            if chat.chat_id in agg and agg[chat.chat_id][1]
+                            else None
+                        ),
+                    }
+                    for chat in chat_rows
+                ]
 
             # Fallback: derive from messages (pre-migration)
             rows = (
