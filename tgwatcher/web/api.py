@@ -4,7 +4,6 @@ import functools
 import json
 import logging
 import os
-import secrets
 import threading
 import time
 from contextlib import contextmanager
@@ -13,13 +12,7 @@ from pathlib import Path
 
 from flask import Blueprint, jsonify, request, Response
 
-from tgwatcher.storage import Storage
 from tgwatcher.client import TGClient
-from tgwatcher.web.crawl_service import CrawlService
-from tgwatcher.signal_filter import KeywordFilter
-from tgwatcher.signal_llm import SignalLLMClient
-from tgwatcher.signal_engine import SignalEngine
-from tgwatcher.web.signal_service import SignalService
 from tgwatcher.web.auto_poll_daemon import AutoPollDaemon
 from tgwatcher.tz_utils import local_to_utc
 
@@ -59,14 +52,6 @@ def _extract_auth_token() -> str:
     return token
 
 
-_storage: Storage | None = None
-_crawl_service: CrawlService | None = None
-_config: dict | None = None
-_async_loop = None
-_auth_token: str | None = None
-_tg_client: TGClient | None = None
-_tg_lock = threading.Lock()
-
 # Real-time listener daemon — encapsulates listener thread, stop_event,
 # running flag, and lock. Phase 2A: extracted from 4 module-level globals.
 from tgwatcher.web.listener_daemon import ListenerDaemon
@@ -85,10 +70,15 @@ _sse_bus = SSEBus()
 # Simple in-memory rate limiter for login endpoints
 _rate_limit_store: dict[str, list[float]] = {}
 
-_signal_service: SignalService | None = None
-_signal_engine: SignalEngine | None = None
-_webhook_dispatcher = None
-_source_quality_tracker = None
+# AppState — encapsulates the 11 cross-domain globals (_storage,
+# _crawl_service, _config, _async_loop, _auth_token, _tg_client, _tg_lock,
+# _signal_service, _signal_engine, _webhook_dispatcher,
+# _source_quality_tracker). Phase 2A full. PEP 562 module __getattr__ /
+# __setattr__ at the bottom of this file forward reads/writes of those 11
+# names to _app_state so existing call sites (179 refs across 45 routes)
+# and tests (api_mod._storage = None) work unchanged.
+from tgwatcher.web.app_state import AppState
+_app_state = AppState()
 
 
 def _get_auth_token_path() -> Path:
@@ -97,19 +87,8 @@ def _get_auth_token_path() -> Path:
 
 
 def _load_or_create_auth_token() -> str:
-    global _auth_token
-    token_path = _get_auth_token_path()
-    if token_path.exists():
-        _auth_token = token_path.read_text().strip()
-        if _auth_token:
-            return _auth_token
-    _auth_token = secrets.token_hex(32)
-    token_path.write_text(_auth_token)
-    logger.info("=" * 60)
-    logger.info("Generated new auth token (also saved to %s)", token_path)
-    logger.info("Token: %s", _auth_token)
-    logger.info("=" * 60)
-    return _auth_token
+    """Backward-compat wrapper — delegates to _app_state.load_or_create_auth_token."""
+    return _app_state.load_or_create_auth_token()
 
 
 def _check_rate_limit(key: str, max_requests: int = 5, window: int = 60) -> bool:
@@ -156,72 +135,8 @@ def require_auth(f):
 
 
 def init_services(config, async_loop=None) -> None:
-    global _storage, _crawl_service, _config, _async_loop, _signal_service, _signal_engine, _webhook_dispatcher
-    _config = config
-    _async_loop = async_loop
-    db_path = config["storage"]["db_path"]
-    _storage = Storage(db_path)
-    _storage.init_db()
-
-    def _on_status_change(status: dict):
-        push_sse_event("crawl_status", status)
-
-    _crawl_service = CrawlService(
-        config, async_loop=async_loop, storage=_storage, on_status_change=_on_status_change,
-        get_tg_client=_get_tg_client, tg_lock=_tg_lock,
-    )
-    _load_or_create_auth_token()
-
-    # Initialize signal engine if enabled
-    signal_cfg = config.get("signal", {})
-    if signal_cfg.get("enabled", False):
-        _init_signal_engine(config)
-    else:
-        _signal_service = None
-        _signal_engine = None
-
-    # Webhook dispatcher — initialized independently of signal engine so
-    # downstream-facing output works even if LLM api_key is missing.
-    from tgwatcher.webhook import WebhookDispatcher
-    _webhook_dispatcher = WebhookDispatcher(config)
-
-    # Auto-catchup on startup
-    catchup_cfg = config.get("catchup", {})
-    if catchup_cfg.get("enabled", True):
-        catchup_groups = [g for g in config.get("groups", []) if g.get("auto_catchup", False)]
-        if catchup_groups:
-            def _delayed_catchup():
-                import time
-                time.sleep(5)
-                logger.info("Auto-catchup: starting for %d groups", len(catchup_groups))
-                _crawl_service.start(mode="catchup")
-            threading.Thread(target=_delayed_catchup, daemon=True).start()
-
-    # Auto-poll daemon — per-group periodic incremental crawl
-    _auto_poll_daemon.set_crawl_service(_crawl_service)
-    _auto_poll_daemon.set_sse_push_callback(push_sse_event)
-    _init_auto_poll(config)
-    threading.Thread(target=_auto_poll_loop, daemon=True, name="auto-poll").start()
-
-    # Register process-lifecycle shutdown for the auto-poll daemon.
-    # atexit covers normal interpreter exit (Ctrl+C, sys.exit). SIGTERM covers
-    # container/production signals. signal.signal must be in the main thread —
-    # under gunicorn workers it raises ValueError, which we swallow and rely
-    # on atexit instead.
-    import atexit
-    import signal as _signal
-
-    def _shutdown_daemons(*_):
-        _auto_poll_shutdown.set()
-
-    atexit.register(_shutdown_daemons)
-    try:
-        _signal.signal(_signal.SIGTERM, _shutdown_daemons)
-    except (ValueError, OSError):
-        logger.info("SIGTERM handler not registered (non-main thread); relying on atexit")
-
-    # Real-time listener — per-group Telethon NewMessage handler
-    _init_listener(config)
+    """Backward-compat wrapper — delegates to _app_state.init_services."""
+    _app_state.init_services(config, async_loop=async_loop)
 
 
 # ── Auto-poll state ─────────────────────────────────────────────────────
@@ -389,64 +304,12 @@ def _stop_listener() -> bool:
 
 
 def _init_signal_engine(config: dict) -> None:
-    """Initialize signal engine, LLM client, and service. Called from init_services.
+    """Backward-compat wrapper — delegates to _app_state.init_signal_engine.
 
     Webhook dispatcher is initialized separately in init_services (not gated
     on signal.enabled or api_key presence).
     """
-    global _signal_service, _signal_engine
-    import os
-    signal_cfg = config.get("signal", {})
-    llm_cfg = signal_cfg.get("llm", {})
-
-    # Build LLMConfig via factory — handles provider routing, legacy compat,
-    # env override, and validation. Raises ValueError on missing/unknown provider.
-    try:
-        from tgwatcher.signal_llm import LLMConfig
-        llm_config = LLMConfig.from_dict(llm_cfg)
-    except ValueError as e:
-        logger.warning("Signal enabled but LLM config invalid: %s. Disabling signal processing.", e)
-        signal_cfg["enabled"] = False
-        _signal_service = None
-        _signal_engine = None
-        return
-
-    keyword_filter = KeywordFilter(signal_cfg)
-    llm_client = SignalLLMClient(llm_config)
-
-    # Signal deduper for downstream-facing push. In-memory cache; lost on
-    # restart (acceptable — worst case a few dup pushes in first minutes).
-    # Set to None when disabled so SignalEngine skips the should_emit call.
-    dedup_cfg = signal_cfg.get("dedup", {})
-    deduper = None
-    if dedup_cfg.get("enabled", True):
-        from tgwatcher.signal_dedup import SignalDeduper
-        window = int(dedup_cfg.get("window_seconds", 300))
-        deduper = SignalDeduper(window_seconds=window)
-        logger.info("Signal deduper enabled (window=%ds)", window)
-
-    _signal_engine = SignalEngine(
-        _storage, keyword_filter, llm_client, signal_cfg,
-        webhook_dispatcher=_webhook_dispatcher,
-        deduper=deduper,
-    )
-
-    def _on_signal_status(status: dict):
-        push_sse_event("signal_process_status", status)
-
-    _signal_service = SignalService(_signal_engine, signal_cfg, on_status_change=_on_signal_status)
-    # Source quality tracker — accumulates outcome feedback per chat.
-    # Skeleton: stats stay 0/empty until Selene starts reporting outcomes
-    # via POST /api/signals/<id>/outcome. In-memory only; lost on restart.
-    global _source_quality_tracker
-    from tgwatcher.source_quality import SourceQualityTracker
-    _source_quality_tracker = SourceQualityTracker()
-    logger.info(
-        "Signal engine initialized (provider=%s, model=%s, webhook=%s)",
-        llm_config.provider,
-        llm_config.model,
-        "enabled" if (_webhook_dispatcher and _webhook_dispatcher.enabled) else "disabled",
-    )
+    _app_state.init_signal_engine(config)
 
 
 def push_sse_event(event_type: str, data: dict) -> None:
@@ -460,38 +323,21 @@ def push_new_message(msg: dict) -> None:
 
 
 def _get_tg_client() -> TGClient:
-    """Get or create the shared TGClient singleton.
+    """Backward-compat wrapper — delegates to _app_state.get_tg_client.
 
     All API endpoints must use this instead of creating their own TelegramClient,
     because Telethon's SQLite session file cannot be opened by multiple clients
     simultaneously (causes 'database is locked' errors).
     """
-    global _tg_client
-    if _tg_client is not None:
-        return _tg_client
-    loop = _async_loop.get_loop() if _async_loop else None
-    _tg_client = TGClient(_config, loop=loop)
-    return _tg_client
+    return _app_state.get_tg_client()
 
 
 def _disconnect_tg_client() -> None:
-    """Disconnect and discard the shared TGClient so the next call gets a fresh one."""
-    global _tg_client
-    if _tg_client is None:
-        return
-    try:
-        if _async_loop:
-            _async_loop.run_coroutine(_tg_client.disconnect())
-        else:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(_tg_client.disconnect())
-            finally:
-                loop.close()
-    except Exception:
-        pass
-    _tg_client = None
+    """Backward-compat wrapper — delegates to _app_state.disconnect_tg_client.
+
+    Disconnects and discards the shared TGClient so the next call gets a fresh one.
+    """
+    _app_state.disconnect_tg_client()
 
 
 def _run_coro(coro, timeout: float = 30.0):
@@ -1694,4 +1540,34 @@ def prometheus_metrics():
     from tgwatcher.web.metrics import collect_metrics
 
     return Response(collect_metrics(), mimetype="text/plain; version=0.0.4")
+
+
+# ── PEP 562 module-level forwarding for the 11 AppState globals ─────────
+# Reads/writes of these names from external code (tests/test_metrics.py,
+# tests/test_signals_export_phase1b.py, tgwatcher/web/metrics.py) are
+# forwarded to _app_state so existing call sites work unchanged. Writes
+# to names NOT in this set fall through to normal module attribute
+# assignment (so _sse_bus, _listener_daemon, _auto_poll_state, etc.
+# remain real module attributes).
+_APP_STATE_FORWARDED = frozenset({
+    "_storage", "_crawl_service", "_config", "_async_loop", "_auth_token",
+    "_signal_engine", "_webhook_dispatcher", "_tg_client", "_tg_lock",
+    "_signal_service", "_source_quality_tracker",
+})
+
+
+def __getattr__(name: str):
+    if name in _APP_STATE_FORWARDED:
+        return getattr(_app_state, name[1:])  # strip leading underscore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __setattr__(name: str, value) -> None:
+    if name in _APP_STATE_FORWARDED:
+        setattr(_app_state, name[1:], value)
+    else:
+        # Fall back to normal module attribute assignment. PEP 562 does not
+        # provide a "default" path, so we manipulate the module dict directly.
+        _sys.modules[__name__].__dict__[name] = value
+
 
