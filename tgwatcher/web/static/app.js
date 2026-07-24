@@ -34,9 +34,9 @@ async function api(path,opts={}){
   const headers={'Content-Type':'application/json',...opts.headers};
   if(authToken)headers['Authorization']='Bearer '+authToken;
   try{const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),15000);
-    const r=await fetch(API+path,{headers,...opts,signal:ctrl.signal});clearTimeout(timer);
+    const r=await fetch(API+path,{headers,...opts,signal:opts.signal||ctrl.signal});clearTimeout(timer);
     if(r.status===401){authToken='';localStorage.removeItem('tgwatcher_token');location.reload();return null}
-    return await r.json()}catch(e){if(e.name==='AbortError')showToast('请求超时 — 请检查服务器','error');else console.error('API error:',e);return null}
+    return await r.json()}catch(e){if(e.name==='AbortError'&&!opts.signal)showToast('请求超时 — 请检查服务器','error');else if(e.name!=='AbortError')console.error('API error:',e);return null}
 }
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function fmtTime(iso){if(!iso)return'-';const d=new Date(iso+'Z');if(isNaN(d))return iso;const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'),h=String(d.getHours()).padStart(2,'0'),mi=String(d.getMinutes()).padStart(2,'0');return `${y}-${m}-${day} ${h}:${mi}`}
@@ -214,14 +214,21 @@ async function loadSenders(){
   sel.innerHTML='<option value="">全部发送者</option>'+senders.map(s=>`<option value="${s.sender_id}"${s.sender_id==cur?' selected':''}>${esc(s.sender_name||'ID:'+s.sender_id)} (${s.msg_count})</option>`).join('');
 }
 
+let _msgReqSeq=0;
+let _msgAbort=null;
 async function loadMessages(page=1){
-  currentPage=page;const params=new URLSearchParams({page,size:pageSize});
+  currentPage=page;const seq=++_msgReqSeq;
+  if(_msgAbort){_msgAbort.abort();_msgAbort=null}
+  const ctrl=new AbortController();_msgAbort=ctrl;
+  const params=new URLSearchParams({page,size:pageSize});
   if(currentChat)params.set('chat_id',currentChat);
   const kw=document.getElementById('searchKeyword').value.trim();if(kw)params.set('keyword',kw);
   const sid=document.getElementById('senderFilter').value;if(sid)params.set('sender_id',sid);
   const df=document.getElementById('searchDateFrom').value;if(df)params.set('date_from',df);
   const dt=document.getElementById('searchDateTo').value;if(dt)params.set('date_to',dt);
-  const data=await api('/api/messages?'+params);if(!data)return;
+  const data=await api('/api/messages?'+params,{signal:ctrl.signal});
+  if(!data)return;
+  if(seq!==_msgReqSeq)return; // stale response, discard
   totalMessages=data.total;const msgs=data.messages||[];
   const tbody=document.getElementById('msgBody');
   if(!msgs.length){tbody.innerHTML='<tr><td colspan="4" style="text-align:center;padding:40px;color:var(--text-3)">暂无消息。请添加群组并开始爬取。</td></tr>'}
@@ -821,22 +828,70 @@ function _fmtDuration(sec){
 
 // ===== SSE =====
 let autoPollState=[];let autoPollTimer=null;
+let _sseAbort=null,_sseRetryIdx=0,_lastSSEId=0;
+const SSE_RETRY_DELAYS=[1000,2000,4000,8000,15000];
+
+function _parseSSE(raw){
+  const evt={};const dataLines=[];
+  raw.split('\n').forEach(line=>{
+    if(line.startsWith('event:'))evt.event=line.slice(6).trim();
+    else if(line.startsWith('data:'))dataLines.push(line.slice(5).replace(/^ /,''));
+    else if(line.startsWith('id:')){const id=parseInt(line.slice(3).trim());if(!isNaN(id))evt.id=id}
+  });
+  evt.data=dataLines.join('\n');
+  return evt;
+}
+
+function _scheduleReconnect(){
+  sseConnected=false;
+  if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);
+  const delay=SSE_RETRY_DELAYS[Math.min(_sseRetryIdx,SSE_RETRY_DELAYS.length-1)];
+  _sseRetryIdx++;
+  console.warn('[SSE] reconnect in',delay,'ms (attempt',_sseRetryIdx,')');
+  setTimeout(()=>{connectSSE()},delay);
+}
 
 function connectSSE(){
   if(!authToken)return;
-  const es=new EventSource(API+'/api/events?token='+authToken);
-  es.addEventListener('crawl_status',e=>{updateCrawlUI(JSON.parse(e.data))});
-  es.addEventListener('new_messages',e=>{
-    if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage);
-  });
-  es.addEventListener('crawl_error',e=>{showToast(e.data,'error')});
-  es.addEventListener('signal_process_status',e=>{checkSignalStatus()});
-  es.addEventListener('auto_poll_tick',e=>{try{const d=JSON.parse(e.data);refreshAutoPollUI()}catch(_){}});
-  es.addEventListener('listener_status',e=>{try{const d=JSON.parse(e.data);refreshListenerBadge(d)}catch(_){}});
-  es.addEventListener('new_signal',e=>{try{const d=JSON.parse(e.data);flashNewSignal(d)}catch(_){}});
-  es.addEventListener('webhook_status',e=>{try{const d=JSON.parse(e.data);refreshWebhookBadge(d)}catch(_){}});
-  es.onopen=()=>{sseConnected=true;if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null};loadAutoPollState();loadListenState();loadWebhookState()};
-  es.onerror=()=>{sseConnected=false;es.close();if(!fallBackInterval)fallBackInterval=setInterval(()=>{loadCrawlStatus()},30000);setTimeout(connectSSE,10000)};
+  if(_sseAbort){_sseAbort.abort();_sseAbort=null}
+  const ctrl=new AbortController();_sseAbort=ctrl;
+  const headers={'Authorization':'Bearer '+authToken};
+  if(_lastSSEId>0)headers['Last-Event-ID']=String(_lastSSEId);
+  fetch(API+'/api/events',{headers,signal:ctrl.signal})
+    .then(r=>{
+      if(!r.ok)throw new Error('SSE HTTP '+r.status);
+      sseConnected=true;_sseRetryIdx=0;
+      if(fallBackInterval){clearInterval(fallBackInterval);fallBackInterval=null}
+      loadAutoPollState();loadListenState();loadWebhookState();
+      const reader=r.body.getReader();
+      const dec=new TextDecoder();
+      let buf='';
+      const handlers={
+        crawl_status:e=>updateCrawlUI(JSON.parse(e.data)),
+        new_messages:e=>{if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage)},
+        crawl_error:e=>{showToast(e.data,'error')},
+        signal_process_status:e=>{checkSignalStatus()},
+        auto_poll_tick:e=>{try{JSON.parse(e.data);refreshAutoPollUI()}catch(_){}},
+        listener_status:e=>{try{refreshListenerBadge(JSON.parse(e.data))}catch(_){}},
+        new_signal:e=>{try{flashNewSignal(JSON.parse(e.data))}catch(_){}},
+        webhook_status:e=>{try{refreshWebhookBadge(JSON.parse(e.data))}catch(_){}}
+      };
+      function pump(){
+        reader.read().then(({done,value})=>{
+          if(done){_scheduleReconnect();return}
+          buf+=dec.decode(value,{stream:true});
+          let idx;
+          while((idx=buf.indexOf('\n\n'))>=0){
+            const raw=buf.slice(0,idx);buf=buf.slice(idx+2);
+            const evt=_parseSSE(raw);
+            if(evt.id&&evt.id>_lastSSEId)_lastSSEId=evt.id;
+            if(evt.event&&handlers[evt.event]){try{handlers[evt.event](evt)}catch(err){console.error('[SSE] handler error',evt.event,err)}}
+          }
+          pump();
+        }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()});
+      }
+      pump();
+    }).catch(e=>{if(e.name!=='AbortError')_scheduleReconnect()});
 }
 
 // ===== AUTO POLL =====

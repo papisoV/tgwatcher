@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
+
+def _iso_z(v) -> str | None:
+    """Serialize datetime to ISO 8601 with Z suffix for API consumers.
+
+    Project DB stores naive UTC datetimes; isoformat() yields no tz suffix.
+    Normalize to Z-suffixed ISO so JS Date() and downstream consumers can
+    parse unambiguously. Aware datetimes are passed through unchanged.
+    None / non-datetime values return None.
+    """
+    if v is None or not hasattr(v, "isoformat"):
+        return None
+    s = v.isoformat()
+    if v.tzinfo is None and not s.endswith(("Z", "+00:00")):
+        s = s + "Z"
+    return s
+
+
 _storage: Storage | None = None
 _crawl_service: CrawlService | None = None
 _config: dict | None = None
@@ -169,6 +186,23 @@ def init_services(config, async_loop=None) -> None:
     _init_auto_poll(config)
     threading.Thread(target=_auto_poll_loop, daemon=True, name="auto-poll").start()
 
+    # Register process-lifecycle shutdown for the auto-poll daemon.
+    # atexit covers normal interpreter exit (Ctrl+C, sys.exit). SIGTERM covers
+    # container/production signals. signal.signal must be in the main thread —
+    # under gunicorn workers it raises ValueError, which we swallow and rely
+    # on atexit instead.
+    import atexit
+    import signal as _signal
+
+    def _shutdown_daemons(*_):
+        _auto_poll_shutdown.set()
+
+    atexit.register(_shutdown_daemons)
+    try:
+        _signal.signal(_signal.SIGTERM, _shutdown_daemons)
+    except (ValueError, OSError):
+        logger.info("SIGTERM handler not registered (non-main thread); relying on atexit")
+
     # Real-time listener — per-group Telethon NewMessage handler
     _init_listener(config)
 
@@ -182,6 +216,11 @@ _auto_poll_lock = threading.Lock()
 # (which only halts the currently-running crawl) — this one halts the daemon
 # that would *start* the next crawl.
 _auto_poll_stop_requested: threading.Event = threading.Event()
+
+# Process-lifecycle shutdown signal. Distinct from _auto_poll_stop_requested
+# (user clicks "stop auto-poll" — reversible, keeps daemon alive) — this one
+# terminates the daemon thread itself on atexit/SIGTERM. See _auto_poll_loop.
+_auto_poll_shutdown: threading.Event = threading.Event()
 
 
 def _init_auto_poll(config: dict) -> None:
@@ -204,11 +243,20 @@ def _init_auto_poll(config: dict) -> None:
 
 
 def _auto_poll_loop() -> None:
-    """Daemon thread: every 1s, scan _auto_poll_state for due ticks and fire incremental crawl."""
+    """Daemon thread: every 1s, scan _auto_poll_state for due ticks and fire incremental crawl.
+
+    Exits when _auto_poll_shutdown is set (atexit/SIGTERM). Uses wait(1) as the
+    per-tick sleep so shutdown wakes the loop immediately rather than blocking
+    up to 1s. The wait is at the top of the loop body so all paths (including
+    the "no due ticks" early-continue) sleep — preventing a busy loop.
+    """
     logger.info("Auto-poll daemon started")
-    while True:
+    while not _auto_poll_shutdown.is_set():
+        # Top-of-loop wait: blocks up to 1s, returns True immediately if
+        # shutdown is set. Prevents busy-loop on empty _auto_poll_state.
+        if _auto_poll_shutdown.wait(1):
+            break
         try:
-            time.sleep(1)
             # User clicked stop — suspend triggering new crawls. Do NOT reset
             # next_tick_at here: the tick stays due so that when the user
             # re-enables auto-poll (clearing the Event), the next crawl fires
@@ -495,8 +543,8 @@ def _atomic_write_config(config: dict, config_path: str) -> None:
 @require_auth
 def get_stats():
     stats = _storage.get_stats()
-    stats["earliest_message"] = stats["earliest_message"].isoformat() if stats["earliest_message"] else None
-    stats["latest_message"] = stats["latest_message"].isoformat() if stats["latest_message"] else None
+    stats["earliest_message"] = _iso_z(stats["earliest_message"])
+    stats["latest_message"] = _iso_z(stats["latest_message"])
     return jsonify(stats)
 
 
@@ -751,7 +799,7 @@ def export_signals():
                 "chat_title": row.chat_title,
                 "sender_name": row.sender_name,
                 "text": row.text,
-                "date": row.date.isoformat() if isinstance(row.date, datetime) else (str(row.date) if row.date else None),
+                "date": _iso_z(row.date) if isinstance(row.date, datetime) else (str(row.date) if row.date else None),
                 "direction": row.direction,
                 "magnitude": row.magnitude,
                 "urgency": row.urgency,
@@ -1197,7 +1245,14 @@ def get_dialogs():
 
 @api.route("/events", methods=["GET"])
 def sse_stream():
-    token = request.args.get("token", "")
+    # Prefer Authorization header (browsers' EventSource can't set headers, but
+    # our fetch-based client can). Fallback to query string for backward compat
+    # — deprecated, will be removed in schema v9.
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        token = request.args.get("token", "")
+        if token and _auth_token:
+            logger.warning("SSE auth via query string is deprecated; use Authorization header")
     if _auth_token and token != _auth_token:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -1549,8 +1604,9 @@ def record_signal_outcome(message_id: int):
         saved = _storage.save_signal_outcome(outcome)
         # Serialize datetimes so jsonify doesn't choke on raw datetime objects.
         for k, v in list(saved.items()):
-            if hasattr(v, "isoformat"):
-                saved[k] = v.isoformat()
+            iso = _iso_z(v)
+            if iso is not None:
+                saved[k] = iso
         # Accumulate into source quality tracker (skeleton — no-op effect
         # until outcomes actually flow in, but the wiring is in place).
         if _source_quality_tracker is not None:
@@ -1596,8 +1652,9 @@ def get_signal_outcomes(message_id: int):
     # Serialize datetimes
     for o in outcomes:
         for k, v in list(o.items()):
-            if hasattr(v, "isoformat"):
-                o[k] = v.isoformat()
+            iso = _iso_z(v)
+            if iso is not None:
+                o[k] = iso
     return jsonify({"message_id": message_id, "chat_id": chat_id, "outcomes": outcomes})
 
 
