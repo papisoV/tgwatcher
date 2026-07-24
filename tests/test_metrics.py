@@ -64,10 +64,9 @@ def test_collect_metrics_with_uninitialized_globals_returns_zeros():
         "_webhook_dispatcher": api_mod._webhook_dispatcher,
         "_listener_running": api_mod._listener_running,
         "_auto_poll_state": getattr(api_mod, "_auto_poll_state", {}),
-        "_sse_listeners": api_mod._sse_listeners,
-        "_sse_events": api_mod._sse_events,
-        "_sse_event_id": api_mod._sse_event_id,
+        "_sse_bus": api_mod._sse_bus,
     }
+    from tgwatcher.web.sse_bus import SSEBus
     try:
         api_mod._storage = None
         api_mod._crawl_service = None
@@ -75,9 +74,8 @@ def test_collect_metrics_with_uninitialized_globals_returns_zeros():
         api_mod._webhook_dispatcher = None
         api_mod._listener_running = False
         api_mod._auto_poll_state = {}
-        api_mod._sse_listeners = []
-        api_mod._sse_events = []
-        api_mod._sse_event_id = 0
+        # Fresh SSE bus with no events/listeners
+        api_mod._sse_bus = SSEBus()
 
         out = collect_metrics()
         assert isinstance(out, str)

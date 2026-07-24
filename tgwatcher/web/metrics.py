@@ -40,13 +40,31 @@ def collect_metrics() -> str:
     from tgwatcher.web import api as _api
 
     def sse_listeners() -> int:
-        return len(getattr(_api, "_sse_listeners", []) or [])
+        bus = getattr(_api, "_sse_bus", None)
+        if bus is None:
+            return 0
+        try:
+            return int(bus.listener_count)
+        except Exception:
+            return 0
 
     def sse_events_buffered() -> int:
-        return len(getattr(_api, "_sse_events", []) or [])
+        bus = getattr(_api, "_sse_bus", None)
+        if bus is None:
+            return 0
+        try:
+            return int(bus.buffered_event_count)
+        except Exception:
+            return 0
 
     def sse_event_id_counter() -> int:
-        return int(getattr(_api, "_sse_event_id", 0) or 0)
+        bus = getattr(_api, "_sse_bus", None)
+        if bus is None:
+            return 0
+        try:
+            return int(bus.current_event_id)
+        except Exception:
+            return 0
 
     def auto_poll_enabled() -> int:
         state = getattr(_api, "_auto_poll_state", {}) or {}

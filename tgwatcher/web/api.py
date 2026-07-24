@@ -72,11 +72,10 @@ _listener_stop_event: "asyncio.Event | None" = None
 _listener_running: bool = False
 _listener_lock = threading.Lock()
 
-# SSE event bus
-_sse_listeners: list[threading.Event] = []
-_sse_events: list[dict] = []
-_sse_lock = threading.Lock()
-_sse_event_id = 0
+# SSE event bus — encapsulates listeners, buffer, lock, and event-id counter.
+# Phase 2A: extracted from 5 module-level globals into SSEBus class.
+from tgwatcher.web.sse_bus import SSEBus
+_sse_bus = SSEBus()
 
 # Simple in-memory rate limiter for login endpoints
 _rate_limit_store: dict[str, list[float]] = {}
@@ -85,8 +84,6 @@ _signal_service: SignalService | None = None
 _signal_engine: SignalEngine | None = None
 _webhook_dispatcher = None
 _source_quality_tracker = None
-
-MAX_SSE_EVENTS = 200
 
 
 def _get_auth_token_path() -> Path:
@@ -477,22 +474,13 @@ def _init_signal_engine(config: dict) -> None:
 
 
 def push_sse_event(event_type: str, data: dict) -> None:
-    global _sse_event_id
-    with _sse_lock:
-        _sse_event_id += 1
-        event = {"id": _sse_event_id, "type": event_type, "data": data}
-        _sse_events.append(event)
-        if len(_sse_events) > MAX_SSE_EVENTS:
-            # Keep the newest MAX_SSE_EVENTS events. Older events are dropped;
-            # clients reconnecting with last_id below the new floor are handled
-            # by the Last-Event-ID fallback in the SSE endpoint.
-            del _sse_events[: len(_sse_events) - MAX_SSE_EVENTS]
-        for listener in _sse_listeners:
-            listener.set()
+    """Backward-compat wrapper around _sse_bus.push. Prefers direct _sse_bus.push
+    at call sites — kept for external callers (e.g. listener.py imports this symbol)."""
+    _sse_bus.push(event_type, data)
 
 
 def push_new_message(msg: dict) -> None:
-    push_sse_event("new_messages", msg)
+    _sse_bus.push("new_messages", msg)
 
 
 def _get_tg_client() -> TGClient:
@@ -1226,25 +1214,7 @@ def sse_stream():
     last_id_str = request.headers.get("Last-Event-ID")
     last_id = int(last_id_str) if (last_id_str and last_id_str.isdigit()) else 0
 
-    listener_event = threading.Event()
-    with _sse_lock:
-        _sse_listeners.append(listener_event)
-        if last_id == 0:
-            # Fresh connection — start from current max, no replay.
-            last_id = _sse_event_id
-        elif _sse_events and last_id < _sse_events[0]["id"]:
-            # Client's last_id is older than the oldest buffered event —
-            # buffer has rolled past. Start from the oldest available to
-            # avoid permanently stalling. Log warning: client will miss
-            # events between last_id and _sse_events[0]["id"].
-            logger.warning(
-                "SSE reconnect: last_id=%d older than buffer floor=%d; "
-                "client will miss intermediate events. Use webhook + "
-                "/api/signals/export?since=<ts> for full compensation.",
-                last_id, _sse_events[0]["id"],
-            )
-            last_id = _sse_events[0]["id"] - 1
-        # else: last_id is within buffer — normal replay path.
+    listener_event, last_id = _sse_bus.register_listener(last_id)
 
     def generate():
         nonlocal last_id
@@ -1252,22 +1222,17 @@ def sse_stream():
             while True:
                 listener_event.wait(timeout=30)
                 listener_event.clear()
-                with _sse_lock:
-                    new_events = [e for e in _sse_events if e["id"] > last_id]
-                    if new_events:
-                        last_id = new_events[-1]["id"]
+                new_events = _sse_bus.events_since(last_id)
+                if new_events:
+                    last_id = new_events[-1]["id"]
                 for event in new_events:
                     yield f"id: {event['id']}\nevent: {event['type']}\ndata: {json.dumps(event['data'], default=str)}\n\n"
                 # Keep event list bounded (secondary check)
-                with _sse_lock:
-                    if len(_sse_events) > MAX_SSE_EVENTS:
-                        del _sse_events[: len(_sse_events) - MAX_SSE_EVENTS]
+                _sse_bus.trim_if_needed()
         except GeneratorExit:
             pass
         finally:
-            with _sse_lock:
-                if listener_event in _sse_listeners:
-                    _sse_listeners.remove(listener_event)
+            _sse_bus.unregister_listener(listener_event)
 
     return Response(
         generate(),
