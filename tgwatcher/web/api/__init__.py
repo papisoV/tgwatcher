@@ -62,10 +62,12 @@ from ._legacy import (  # noqa: F401
 
 from .routes_auth import bp as auth_bp
 from .routes_messages import bp as messages_bp
+from .routes_signals import bp as signals_bp
 from .routes_stats import bp as stats_bp
 
 api.register_blueprint(auth_bp)
 api.register_blueprint(messages_bp)
+api.register_blueprint(signals_bp)
 api.register_blueprint(stats_bp)
 
 
