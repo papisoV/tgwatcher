@@ -62,17 +62,18 @@ def test_collect_metrics_with_uninitialized_globals_returns_zeros():
         "_crawl_service": api_mod._crawl_service,
         "_signal_engine": api_mod._signal_engine,
         "_webhook_dispatcher": api_mod._webhook_dispatcher,
-        "_listener_running": api_mod._listener_running,
+        "_listener_daemon": api_mod._listener_daemon,
         "_auto_poll_state": getattr(api_mod, "_auto_poll_state", {}),
         "_sse_bus": api_mod._sse_bus,
     }
     from tgwatcher.web.sse_bus import SSEBus
+    from tgwatcher.web.listener_daemon import ListenerDaemon
     try:
         api_mod._storage = None
         api_mod._crawl_service = None
         api_mod._signal_engine = None
         api_mod._webhook_dispatcher = None
-        api_mod._listener_running = False
+        api_mod._listener_daemon = ListenerDaemon()
         api_mod._auto_poll_state = {}
         # Fresh SSE bus with no events/listeners
         api_mod._sse_bus = SSEBus()

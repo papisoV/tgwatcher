@@ -20,6 +20,7 @@ from tgwatcher.signal_filter import KeywordFilter
 from tgwatcher.signal_llm import SignalLLMClient
 from tgwatcher.signal_engine import SignalEngine
 from tgwatcher.web.signal_service import SignalService
+from tgwatcher.web.auto_poll_daemon import AutoPollDaemon
 from tgwatcher.tz_utils import local_to_utc
 
 logger = logging.getLogger(__name__)
@@ -66,11 +67,15 @@ _auth_token: str | None = None
 _tg_client: TGClient | None = None
 _tg_lock = threading.Lock()
 
-# Listener state (real-time Telethon NewMessage/Edited/Deleted)
-_listener_thread: threading.Thread | None = None
-_listener_stop_event: "asyncio.Event | None" = None
-_listener_running: bool = False
-_listener_lock = threading.Lock()
+# Real-time listener daemon — encapsulates listener thread, stop_event,
+# running flag, and lock. Phase 2A: extracted from 4 module-level globals.
+from tgwatcher.web.listener_daemon import ListenerDaemon
+_listener_daemon = ListenerDaemon()
+# Late-binding host reference: daemon reads api.py module state (_async_loop,
+# _tg_client_guard, _get_tg_client, _storage, _signal_engine, push_sse_event,
+# push_new_message) at call time via this getter. Avoids circular import.
+import sys as _sys
+_listener_daemon.bind_host(lambda: _sys.modules[__name__])
 
 # SSE event bus — encapsulates listeners, buffer, lock, and event-id counter.
 # Phase 2A: extracted from 5 module-level globals into SSEBus class.
@@ -193,6 +198,8 @@ def init_services(config, async_loop=None) -> None:
             threading.Thread(target=_delayed_catchup, daemon=True).start()
 
     # Auto-poll daemon — per-group periodic incremental crawl
+    _auto_poll_daemon.set_crawl_service(_crawl_service)
+    _auto_poll_daemon.set_sse_push_callback(push_sse_event)
     _init_auto_poll(config)
     threading.Thread(target=_auto_poll_loop, daemon=True, name="auto-poll").start()
 
@@ -218,97 +225,137 @@ def init_services(config, async_loop=None) -> None:
 
 
 # ── Auto-poll state ─────────────────────────────────────────────────────
-_auto_poll_state: dict[int, dict] = {}  # {chat_id: {enabled, interval, next_tick_at, name}}
-_auto_poll_lock = threading.Lock()
-# Set by stop_crawl() so the auto-poll daemon suspends triggering new crawls
-# after a user-initiated stop. Cleared when auto-poll is re-enabled via
-# update_auto_poll() or on fresh startup. Distinct from _crawl_service._stop_event
-# (which only halts the currently-running crawl) — this one halts the daemon
-# that would *start* the next crawl.
-_auto_poll_stop_requested: threading.Event = threading.Event()
-
-# Process-lifecycle shutdown signal. Distinct from _auto_poll_stop_requested
-# (user clicks "stop auto-poll" — reversible, keeps daemon alive) — this one
-# terminates the daemon thread itself on atexit/SIGTERM. See _auto_poll_loop.
-_auto_poll_shutdown: threading.Event = threading.Event()
+# Encapsulated in AutoPollDaemon. Module-level shims below preserve backward
+# compat for callers that import `_auto_poll_loop` / `_auto_poll_shutdown`
+# (tests/test_bugfix_2026_07_24.py) and for code that reads
+# `api_mod._auto_poll_state` (tests/test_metrics.py, web/metrics.py).
+_auto_poll_daemon = AutoPollDaemon()
 
 
 def _init_auto_poll(config: dict) -> None:
-    """Populate _auto_poll_state from config (called at startup)."""
-    # Fresh startup — clear any stale stop signal from a previous run.
-    _auto_poll_stop_requested.clear()
-    with _auto_poll_lock:
-        _auto_poll_state.clear()
-        now = time.time()
-        for g in config.get("groups", []):
-            gid = g.get("id")
-            if not gid:
-                continue
-            _auto_poll_state[gid] = {
-                "enabled": bool(g.get("auto_poll", False)),
-                "interval": int(g.get("poll_interval_seconds", 15)),
-                "next_tick_at": now + int(g.get("poll_interval_seconds", 15)),
-                "name": g.get("name", str(gid)),
-            }
+    """Backward-compat wrapper — delegates to _auto_poll_daemon.init_from_config."""
+    _auto_poll_daemon.init_from_config(config)
 
 
 def _auto_poll_loop() -> None:
-    """Daemon thread: every 1s, scan _auto_poll_state for due ticks and fire incremental crawl.
+    """Backward-compat wrapper — delegates to _auto_poll_daemon.run_loop."""
+    _auto_poll_daemon.run_loop()
 
-    Exits when _auto_poll_shutdown is set (atexit/SIGTERM). Uses wait(1) as the
-    per-tick sleep so shutdown wakes the loop immediately rather than blocking
-    up to 1s. The wait is at the top of the loop body so all paths (including
-    the "no due ticks" early-continue) sleep — preventing a busy loop.
+
+# Module-level proxy for the shutdown Event. Supports .set()/.clear()/.is_set()/.wait()
+# for callers that imported `_auto_poll_shutdown` directly (tests). All ops delegate
+# to the daemon's internal _shutdown Event.
+class _AutoPollShutdownProxy:
+    __slots__ = ()
+
+    def set(self) -> None:
+        _auto_poll_daemon.signal_shutdown()
+
+    def clear(self) -> None:
+        _auto_poll_daemon.clear_shutdown()
+
+    def is_set(self) -> bool:
+        return _auto_poll_daemon.is_shutdown_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return _auto_poll_daemon.wait_shutdown(timeout)
+
+
+_auto_poll_shutdown = _AutoPollShutdownProxy()
+
+
+# Module-level proxy for the stop-requested Event (stop_crawl / update_auto_poll
+# use .set()/.clear() — preserved for minimal-diff edits at call sites).
+class _AutoPollStopRequestedProxy:
+    __slots__ = ()
+
+    def set(self) -> None:
+        _auto_poll_daemon.request_stop()
+
+    def clear(self) -> None:
+        _auto_poll_daemon.clear_stop()
+
+    def is_set(self) -> bool:
+        return _auto_poll_daemon.is_stop_requested()
+
+
+_auto_poll_stop_requested = _AutoPollStopRequestedProxy()
+
+
+# Module-level proxy for _auto_poll_state. metrics.py + test_metrics.py read
+# `getattr(_api, "_auto_poll_state", {})` and iterate `state.values()` —
+# returning the daemon's live _state dict preserves that shape. The lock
+# (`_auto_poll_lock`) is exposed the same way for `with _auto_poll_lock:`
+# blocks at the endpoint call sites.
+class _AutoPollStateProxy:
+    """Mapping-like proxy over the daemon's _state dict.
+
+    Supports `len()`, `in`, iteration, `.items()`, `.get()`, `.values()`,
+    subscript access, and dict-style mutation (`_state[k] = v`, `del _state[k]`,
+    `.clear()`). Reads/writes happen on the live backing dict; callers that
+    need atomicity should use `with _auto_poll_lock:` (proxied below).
     """
-    logger.info("Auto-poll daemon started")
-    while not _auto_poll_shutdown.is_set():
-        # Top-of-loop wait: blocks up to 1s, returns True immediately if
-        # shutdown is set. Prevents busy-loop on empty _auto_poll_state.
-        if _auto_poll_shutdown.wait(1):
-            break
-        try:
-            # User clicked stop — suspend triggering new crawls. Do NOT reset
-            # next_tick_at here: the tick stays due so that when the user
-            # re-enables auto-poll (clearing the Event), the next crawl fires
-            # immediately rather than waiting a full interval.
-            if _auto_poll_stop_requested.is_set():
-                continue
-            now = time.time()
-            # Skip if any crawl currently running — leave next_tick_at untouched so
-            # the tick fires as soon as the running crawl finishes (no lost tick).
-            if _crawl_service and _crawl_service.status.get("running"):
-                continue
-            with _auto_poll_lock:
-                due = [
-                    (cid, s) for cid, s in _auto_poll_state.items()
-                    if s["enabled"] and now >= s["next_tick_at"]
-                ]
-                if not due:
-                    continue
-                # Trigger only the most-due group; reschedule all due so they don't pile up.
-                due.sort(key=lambda cs: cs[1]["next_tick_at"])
-                cid, s = due[0]
-                s["next_tick_at"] = now + s["interval"]
-                # Other due groups: reschedule to next cycle too (avoid back-to-back stacking)
-                for other_cid, other_s in due[1:]:
-                    other_s["next_tick_at"] = now + other_s["interval"]
-            logger.info(
-                "Auto-poll: triggering incremental crawl",
-                extra={"chat_id": cid, "chat_name": s.get("name"), "action": "crawl_start"},
-            )
-            try:
-                if _crawl_service:
-                    _crawl_service.start(mode="incremental", group_id=cid)
-            except Exception as e:
-                logger.warning("Auto-poll crawl start failed", extra={"chat_id": cid, "error": str(e)})
-            push_sse_event("auto_poll_tick", {
-                "chat_id": cid,
-                "name": s.get("name"),
-                "next_tick_at": s["next_tick_at"],
-                "interval": s["interval"],
-            })
-        except Exception as e:
-            logger.warning("Auto-poll loop error: %s", e)
+
+    __slots__ = ("_lock_proxy",)
+
+    def __init__(self) -> None:
+        # Bound late to avoid circular reference at class-definition time.
+        self._lock_proxy = _auto_poll_lock
+
+    def _state(self) -> dict[int, dict]:
+        return _auto_poll_daemon.state
+
+    def __len__(self) -> int:
+        return len(self._state())
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._state()
+
+    def __iter__(self):
+        return iter(self._state())
+
+    def __getitem__(self, key: int) -> dict:
+        return self._state()[key]
+
+    def __setitem__(self, key: int, value: dict) -> None:
+        self._state()[key] = value
+
+    def __delitem__(self, key: int) -> None:
+        del self._state()[key]
+
+    def items(self):
+        return self._state().items()
+
+    def values(self):
+        return self._state().values()
+
+    def keys(self):
+        return self._state().keys()
+
+    def get(self, key: int, default=None):
+        return self._state().get(key, default)
+
+    def clear(self) -> None:
+        self._state().clear()
+
+    def __repr__(self) -> str:
+        return repr(self._state())
+
+
+class _AutoPollLockProxy:
+    """Context-manager proxy over the daemon's internal _lock."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return _auto_poll_daemon.lock.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return _auto_poll_daemon.lock.__exit__(exc_type, exc, tb)
+
+
+_auto_poll_lock = _AutoPollLockProxy()
+_auto_poll_state = _AutoPollStateProxy()
 
 
 # ── Real-time listener state ─────────────────────────────────────────────
@@ -318,98 +365,27 @@ def _get_listen_groups(config: dict) -> list[dict]:
 
 
 def _init_listener(config: dict) -> None:
-    """Start the real-time listener if any group has auto_listen=true. Called from init_services."""
-    listen_groups = _get_listen_groups(config)
-    if not listen_groups:
-        logger.info("Listener: no groups with auto_listen=true, skipping startup")
-        return
-    _start_listener_thread(listen_groups)
+    """Start the real-time listener if any group has auto_listen=true.
+
+    Backward-compat wrapper — delegates to `_listener_daemon.init_from_config`.
+    Called from init_services at startup.
+    """
+    _listener_daemon.init_from_config(config)
 
 
 def _start_listener_thread(listen_groups: list[dict]) -> bool:
-    """Schedule start_listener on the shared _async_loop. Returns False if already running.
-    The listener coroutine runs on the _async_loop thread (same loop as crawl_service),
-    so it shares the TGClient and event loop without conflict."""
-    global _listener_thread, _listener_stop_event, _listener_running
-    with _listener_lock:
-        if _listener_running:
-            logger.warning("Listener: already running, ignoring start request")
-            return False
-        loop = _async_loop.get_loop() if _async_loop else None
-        if loop is None:
-            logger.error("Listener: no async loop available")
-            return False
-
-        # Synchronously ensure TGClient is connected (holds _tg_lock via guard).
-        # Done outside the _async_loop to avoid racing with other loop coroutines
-        # and to prevent "database is locked" on telethon's SQLite session.
-        try:
-            with _tg_client_guard() as _tg:
-                pass  # connect only; tg is yielded but unused here
-        except Exception as e:
-            logger.error("Listener: TGClient connect failed: %s", e, exc_info=True)
-            push_sse_event("listener_status", {"enabled": False, "error": f"connect failed: {e}"})
-            return False
-
-        async def _runner():
-            global _listener_stop_event
-            # Create stop_event FIRST so _stop_listener() can signal even during listener startup
-            _listener_stop_event = asyncio.Event()
-            try:
-                await _run_listener_async(listen_groups)
-            except Exception as e:
-                logger.error("Listener coroutine crashed: %s", e, exc_info=True)
-                with _listener_lock:
-                    _listener_running = False
-                push_sse_event("listener_status", {"enabled": False, "error": str(e)})
-
-        # Schedule the coroutine on the shared _async_loop thread
-        asyncio.run_coroutine_threadsafe(_runner(), loop)
-        _listener_running = True
-        # _listener_thread stays None — we don't own a thread; runs on _async_loop thread
-        logger.info("Listener coroutine scheduled for %d groups", len(listen_groups))
-        push_sse_event("listener_status", {"enabled": True, "groups": [g.get("name", g.get("id")) for g in listen_groups]})
-        return True
+    """Backward-compat wrapper — delegates to `_listener_daemon.start_thread`."""
+    return _listener_daemon.start_thread(listen_groups)
 
 
 async def _run_listener_async(listen_groups: list[dict]) -> None:
-    """Run start_listener on the shared TGClient. Stops when _listener_stop_event is set.
-
-    Pre-condition: TGClient must be connected before this is called (via _tg_client_guard
-    in the caller thread) to avoid racing with other telethon session writers."""
-    global _listener_running
-    from tgwatcher.listener import start_listener
-    tg = _get_tg_client()
-    if tg.client is None or not tg.client.is_connected():
-        logger.error("Listener: TGClient not connected on entry; caller must connect first")
-        return
-    try:
-        await start_listener(
-            tg, _storage, listen_groups,
-            on_new_message=push_new_message,
-            signal_engine=_signal_engine,
-            stop_event=_listener_stop_event,
-        )
-    finally:
-        with _listener_lock:
-            _listener_running = False
-        logger.info("Listener thread exiting")
-        push_sse_event("listener_status", {"enabled": False})
+    """Backward-compat wrapper — delegates to `_listener_daemon.run_async`."""
+    await _listener_daemon.run_async(listen_groups)
 
 
 def _stop_listener() -> bool:
-    """Signal the listener to stop. Returns True if signal was sent.
-    The runner's _run_listener_async races connect against stop_event.wait(),
-    so stop during connect phase still aborts."""
-    global _listener_stop_event
-    with _listener_lock:
-        if not _listener_running or _listener_stop_event is None:
-            return False
-        loop = _async_loop.get_loop() if _async_loop else None
-        if loop is None:
-            return False
-        loop.call_soon_threadsafe(_listener_stop_event.set)
-        return True
+    """Backward-compat wrapper — delegates to `_listener_daemon.stop`."""
+    return _listener_daemon.stop()
 
 
 def _init_signal_engine(config: dict) -> None:
@@ -1134,14 +1110,14 @@ def toggle_group_auto_listen(chat_id: int):
 
     # Side-effect: start/stop listener based on remaining auto_listen groups
     listen_groups = _get_listen_groups(_config)
-    if auto_listen and not _listener_running and listen_groups:
+    if auto_listen and not _listener_daemon.is_running and listen_groups:
         _start_listener_thread(listen_groups)
-    elif not auto_listen and not listen_groups and _listener_running:
+    elif not auto_listen and not listen_groups and _listener_daemon.is_running:
         _stop_listener()
 
     return jsonify({"status": "updated", "chat_id": chat_id,
                     "auto_listen": bool(auto_listen),
-                    "listener_running": _listener_running})
+                    "listener_running": _listener_daemon.is_running})
 
 
 @api.route("/listen/status", methods=["GET"])
@@ -1150,7 +1126,7 @@ def get_listen_status():
     """Return current listener state: enabled (running), groups being listened to."""
     listen_groups = _get_listen_groups(_config)
     return jsonify({
-        "enabled": _listener_running,
+        "enabled": _listener_daemon.is_running,
         "groups": [{"chat_id": g.get("id"), "name": g.get("name", g.get("id"))} for g in listen_groups],
     })
 
@@ -1169,14 +1145,14 @@ def patch_listen_status():
         listen_groups = _get_listen_groups(_config)
         if not listen_groups:
             return jsonify({"error": "No groups with auto_listen=true. Enable auto_listen on at least one group first."}), 400
-        if _listener_running:
+        if _listener_daemon.is_running:
             return jsonify({"status": "already_running", "groups": [g.get("name") for g in listen_groups]})
         ok = _start_listener_thread(listen_groups)
         if not ok:
             return jsonify({"error": "Failed to start listener (check logs)"}), 500
         return jsonify({"status": "started", "groups": [g.get("name") for g in listen_groups]})
     else:
-        if not _listener_running:
+        if not _listener_daemon.is_running:
             return jsonify({"status": "already_stopped"})
         _stop_listener()
         return jsonify({"status": "stopping"})

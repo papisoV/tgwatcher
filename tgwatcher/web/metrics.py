@@ -89,7 +89,8 @@ def collect_metrics() -> str:
         return 1 if getattr(_api, "_signal_engine", None) is not None else 0
 
     def listener_running() -> int:
-        return 1 if getattr(_api, "_listener_running", False) else 0
+        daemon = getattr(_api, "_listener_daemon", None)
+        return 1 if (daemon is not None and daemon.is_running) else 0
 
     def webhook_configured() -> int:
         disp = getattr(_api, "_webhook_dispatcher", None)
