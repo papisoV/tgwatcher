@@ -364,40 +364,7 @@ def _atomic_write_config(config: dict, config_path: str) -> None:
 
 
 # --- Data Query APIs ---
-
-@api.route("/stats", methods=["GET"])
-@require_auth
-def get_stats():
-    stats = _storage.get_stats()
-    stats["earliest_message"] = _iso_z(stats["earliest_message"])
-    stats["latest_message"] = _iso_z(stats["latest_message"])
-    return jsonify(stats)
-
-
-@api.route("/stats/trend", methods=["GET"])
-@require_auth
-def get_stats_trend():
-    period = request.args.get("period", "day")
-    days = request.args.get("days", 30, type=int)
-    chat_id = request.args.get("chat_id", type=int)
-    days = max(1, min(days, 365))
-    result = _storage.get_message_trend(period=period, days=days, chat_id=chat_id)
-    return jsonify(result)
-
-
-@api.route("/stats/heatmap", methods=["GET"])
-@require_auth
-def get_stats_heatmap():
-    chat_id = request.args.get("chat_id", type=int)
-    result = _storage.get_activity_heatmap(chat_id=chat_id)
-    return jsonify(result)
-
-
-@api.route("/stats/comparison", methods=["GET"])
-@require_auth
-def get_stats_comparison():
-    result = _storage.get_group_comparison()
-    return jsonify(result)
+# NOTE: /stats/* routes moved to .routes_stats sub-blueprint (Phase 2B batch 1).
 
 
 @api.route("/messages", methods=["GET"])
@@ -1068,96 +1035,8 @@ def sse_stream():
 
 
 # --- Login API ---
-
-
-@api.route("/auth/bootstrap", methods=["GET"])
-def auth_bootstrap():
-    """Auto-login for localhost: returns the auth token so the browser can
-    store it in localStorage, skipping the manual token entry step.
-
-    Only responds to loopback / same-host requests — the token file already
-    lives on the user's machine, so this just removes the copy-paste step.
-    Remote requests get 403.
-    """
-    ip = request.remote_addr or "unknown"
-    if not _check_rate_limit(f"auth_bootstrap:{ip}", max_requests=10, window=60):
-        return jsonify({"error": "Rate limited"}), 429
-
-    if _auth_token is None:
-        return jsonify({"token": None})
-
-    loopback = {"127.0.0.1", "::1", "localhost"}
-    if ip not in loopback:
-        return jsonify({"error": "Forbidden"}), 403
-
-    return jsonify({"token": _auth_token})
-
-
-@api.route("/login/status", methods=["GET"])
-def login_status():
-    ip = request.remote_addr or "unknown"
-    if not _check_rate_limit(f"login_status:{ip}", max_requests=30, window=60):
-        return jsonify({"error": "Rate limited"}), 429
-
-    if _auth_token is not None:
-        token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        if not token:
-            token = request.args.get("token", "")
-        if token != _auth_token:
-            return jsonify({"error": "Unauthorized"}), 401
-
-    phone = _config["telegram"]["phone"]
-
-    try:
-        with _tg_client_guard() as tg:
-            connected = _run_coro(tg.client.is_user_authorized())
-    except Exception as e:
-        logger.warning("Login status check failed: %s", e, exc_info=True)
-        connected = False
-
-    return jsonify({"logged_in": connected, "phone": phone})
-
-
-@api.route("/login", methods=["POST"])
-def do_login():
-    ip = request.remote_addr or "unknown"
-    if not _check_rate_limit(f"login:{ip}"):
-        return jsonify({"error": "Rate limited"}), 429
-
-    if _auth_token is not None:
-        token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        if token != _auth_token:
-            return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    code = data.get("code")
-    phone_code_hash = data.get("phone_code_hash")
-
-    phone = _config["telegram"]["phone"]
-
-    try:
-        with _tg_client_guard() as tg:
-            authorized = _run_coro(tg.client.is_user_authorized())
-
-            if authorized:
-                return jsonify({"status": "already_logged_in"})
-
-            if code and phone_code_hash:
-                try:
-                    _run_coro(tg.client.sign_in(phone, code, phone_code_hash=phone_code_hash))
-                    return jsonify({"status": "logged_in"})
-                except Exception as e:
-                    return jsonify({"error": str(e)}), 400
-            else:
-                try:
-                    result = _run_coro(tg.client.send_code_request(phone))
-                    return jsonify({"status": "code_sent", "phone_code_hash": result.phone_code_hash})
-                except Exception as e:
-                    return jsonify({"error": str(e)}), 400
-
-    except Exception as e:
-        logger.error("Login error: %s", e, exc_info=True)
-        return jsonify({"error": str(e)}), 500
+# NOTE: /auth/bootstrap, /login/status, /login routes moved to .routes_auth
+# sub-blueprint (Phase 2B batch 1).
 
 
 # ── Signal API endpoints ──────────────────────────────────────────────
