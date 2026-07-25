@@ -2,11 +2,13 @@
 
 A batch run processes hundreds-to-thousands of messages, taking hours. If
 the process crashes mid-run, all progress is lost. This module provides
-atomic JSON checkpoint persistence per chat, so a crash only loses at
-most ``max_batch_size - 1`` items.
+atomic JSON checkpoint persistence, so a crash only loses at most
+``max_batch_size - 1`` items.
 
 Design:
-- One JSON file per chat: ``batch_checkpoint_{chat_id}.json``
+- One JSON file per checkpoint scope. For per-chat scope:
+  ``batch_checkpoint_{chat_id}.json``. For global (cross-chat) scope:
+  ``batch_checkpoint_global.json`` (uses ``CHAT_ID_GLOBAL = 0`` sentinel).
 - Atomic write: ``tmp.replace(path)`` — POSIX and Windows both guarantee
   atomicity for ``os.replace`` / ``Path.replace``
 - Corrupt-file tolerant: ``_load_checkpoint`` returns None + logs warning
@@ -14,7 +16,7 @@ Design:
 - Caller owns the lifecycle: load at start, save every N successes,
   delete on batch completion
 
-Usage:
+Usage (per-chat):
     from tgwatcher.batch_checkpoint import (
         BatchCheckpoint, save_checkpoint, load_checkpoint, delete_checkpoint,
     )
@@ -22,14 +24,22 @@ Usage:
     cp = load_checkpoint("./batch_checkpoints", chat_id=123)
     start_msg_id = cp.last_message_id if cp else 0
     # ... process messages with id > start_msg_id ...
-    for i, msg in enumerate(messages):
-        process(msg)
-        if (i + 1) % max_batch_size == 0:
-            save_checkpoint("./batch_checkpoints", BatchCheckpoint(
-                chat_id=chat_id, last_message_id=msg["id"],
-                processed_count=i + 1, started_at=start_iso, saved_at=now_iso,
-            ))
-    delete_checkpoint("./batch_checkpoints", chat_id)
+    save_checkpoint("./batch_checkpoints", BatchCheckpoint(
+        chat_id=123, last_message_id=msg["id"],
+        processed_count=i + 1, started_at=start_iso, saved_at=now_iso,
+    ))
+    delete_checkpoint("./batch_checkpoints", chat_id=123)
+
+Usage (global / cross-chat):
+    from tgwatcher.batch_checkpoint import (
+        CHAT_ID_GLOBAL, save_global_checkpoint, load_global_checkpoint,
+        delete_global_checkpoint, make_global_checkpoint,
+    )
+
+    cp = load_global_checkpoint("./batch_checkpoints")
+    # ... process messages with message_id > cp.last_message_id ...
+    save_global_checkpoint("./batch_checkpoints", cp)
+    delete_global_checkpoint("./batch_checkpoints")
 """
 from __future__ import annotations
 
@@ -41,10 +51,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Sentinel chat_id for cross-chat / global checkpoints. Use this when
+# the batch processes messages across all chats in a single stream.
+CHAT_ID_GLOBAL: int = 0
+
+# Filename for the global checkpoint (uses CHAT_ID_GLOBAL sentinel).
+_GLOBAL_FILENAME: str = "batch_checkpoint_global.json"
+
 
 @dataclass(frozen=True)
 class BatchCheckpoint:
-    """Persistent state of an in-flight LLM batch run for one chat."""
+    """Persistent state of an in-flight LLM batch run.
+
+    For per-chat scope, ``chat_id`` is the actual chat id.
+    For global scope, ``chat_id`` is ``CHAT_ID_GLOBAL`` (0).
+    """
     chat_id: int
     last_message_id: int
     processed_count: int
@@ -53,7 +74,13 @@ class BatchCheckpoint:
 
 
 def _checkpoint_path(checkpoint_dir: str | Path, chat_id: int) -> Path:
-    """Return the checkpoint file path for one chat."""
+    """Return the checkpoint file path for one scope.
+
+    For ``chat_id=CHAT_ID_GLOBAL`` returns the global checkpoint path.
+    Otherwise returns ``batch_checkpoint_{chat_id}.json``.
+    """
+    if chat_id == CHAT_ID_GLOBAL:
+        return Path(checkpoint_dir) / _GLOBAL_FILENAME
     return Path(checkpoint_dir) / f"batch_checkpoint_{chat_id}.json"
 
 
@@ -128,4 +155,44 @@ def make_checkpoint(chat_id: int, last_message_id: int, processed_count: int, st
         processed_count=processed_count,
         started_at=started_at,
         saved_at=_iso_now(),
+    )
+
+
+# ── Global (cross-chat) convenience wrappers ────────────────────────────
+
+def save_global_checkpoint(checkpoint_dir: str | Path, cp: BatchCheckpoint) -> None:
+    """Save a global (cross-chat) checkpoint.
+
+    ``cp.chat_id`` is forced to ``CHAT_ID_GLOBAL`` to ensure the file
+    lands at ``batch_checkpoint_global.json`` regardless of what the
+    caller passed.
+    """
+    if cp.chat_id != CHAT_ID_GLOBAL:
+        cp = BatchCheckpoint(
+            chat_id=CHAT_ID_GLOBAL,
+            last_message_id=cp.last_message_id,
+            processed_count=cp.processed_count,
+            started_at=cp.started_at,
+            saved_at=cp.saved_at,
+        )
+    save_checkpoint(checkpoint_dir, cp)
+
+
+def load_global_checkpoint(checkpoint_dir: str | Path) -> BatchCheckpoint | None:
+    """Load the global (cross-chat) checkpoint, or None if missing/corrupt."""
+    return load_checkpoint(checkpoint_dir, CHAT_ID_GLOBAL)
+
+
+def delete_global_checkpoint(checkpoint_dir: str | Path) -> None:
+    """Delete the global (cross-chat) checkpoint."""
+    delete_checkpoint(checkpoint_dir, CHAT_ID_GLOBAL)
+
+
+def make_global_checkpoint(last_message_id: int, processed_count: int, started_at: str) -> BatchCheckpoint:
+    """Convenience factory for global checkpoints — chat_id forced to 0."""
+    return make_checkpoint(
+        chat_id=CHAT_ID_GLOBAL,
+        last_message_id=last_message_id,
+        processed_count=processed_count,
+        started_at=started_at,
     )

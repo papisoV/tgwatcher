@@ -7,6 +7,7 @@ Verifies:
 - save is atomic (no partial file on simulated crash)
 - delete removes the file
 - make_checkpoint fills saved_at automatically
+- Global (cross-chat) wrappers use CHAT_ID_GLOBAL sentinel + correct filename
 """
 from __future__ import annotations
 
@@ -17,11 +18,16 @@ from pathlib import Path
 import pytest
 
 from tgwatcher.batch_checkpoint import (
+    CHAT_ID_GLOBAL,
     BatchCheckpoint,
     delete_checkpoint,
+    delete_global_checkpoint,
     load_checkpoint,
+    load_global_checkpoint,
     make_checkpoint,
+    make_global_checkpoint,
     save_checkpoint,
+    save_global_checkpoint,
 )
 
 
@@ -170,3 +176,88 @@ class TestSimulatedResume:
         # On completion, caller deletes checkpoint
         delete_checkpoint(cp_dir, 42)
         assert load_checkpoint(cp_dir, 42) is None
+
+
+class TestGlobalCheckpoint:
+    """Global (cross-chat) wrappers — used by batch scripts that process
+    messages across all chats in a single stream."""
+
+    def test_save_global_uses_global_filename(self, cp_dir: Path):
+        cp = make_global_checkpoint(
+            last_message_id=500, processed_count=100,
+            started_at="2026-07-25T10:00:00Z",
+        )
+        save_global_checkpoint(cp_dir, cp)
+        # File should be batch_checkpoint_global.json, not batch_checkpoint_0.json
+        assert (cp_dir / "batch_checkpoint_global.json").exists()
+        assert not (cp_dir / "batch_checkpoint_0.json").exists()
+
+    def test_load_global_returns_none_when_missing(self, cp_dir: Path):
+        assert load_global_checkpoint(cp_dir) is None
+
+    def test_save_then_load_global_round_trip(self, cp_dir: Path):
+        cp = make_global_checkpoint(
+            last_message_id=999, processed_count=42,
+            started_at="2026-07-25T10:00:00Z",
+        )
+        save_global_checkpoint(cp_dir, cp)
+        loaded = load_global_checkpoint(cp_dir)
+        assert loaded is not None
+        assert loaded.chat_id == CHAT_ID_GLOBAL
+        assert loaded.last_message_id == 999
+        assert loaded.processed_count == 42
+
+    def test_save_global_forces_chat_id_to_zero(self, cp_dir: Path):
+        """Even if caller passes a non-zero chat_id, the global wrapper
+        forces it to CHAT_ID_GLOBAL so the file lands at the global path."""
+        cp = BatchCheckpoint(
+            chat_id=42,  # wrong — should be 0 for global
+            last_message_id=100, processed_count=10,
+            started_at="2026-07-25T10:00:00Z", saved_at="2026-07-25T10:05:00Z",
+        )
+        save_global_checkpoint(cp_dir, cp)
+        loaded = load_global_checkpoint(cp_dir)
+        assert loaded is not None
+        assert loaded.chat_id == CHAT_ID_GLOBAL
+        assert loaded.last_message_id == 100
+
+    def test_delete_global_removes_file(self, cp_dir: Path):
+        cp = make_global_checkpoint(
+            last_message_id=1, processed_count=1,
+            started_at="2026-07-25T10:00:00Z",
+        )
+        save_global_checkpoint(cp_dir, cp)
+        assert (cp_dir / "batch_checkpoint_global.json").exists()
+        delete_global_checkpoint(cp_dir)
+        assert not (cp_dir / "batch_checkpoint_global.json").exists()
+
+    def test_delete_global_missing_is_noop(self, cp_dir: Path):
+        delete_global_checkpoint(cp_dir)  # should not raise
+
+    def test_make_global_checkpoint_sets_chat_id_zero(self):
+        cp = make_global_checkpoint(
+            last_message_id=1, processed_count=1,
+            started_at="2026-07-25T10:00:00Z",
+        )
+        assert cp.chat_id == CHAT_ID_GLOBAL
+        assert cp.chat_id == 0
+
+    def test_simulated_crash_resume_global(self, cp_dir: Path):
+        """End-to-end: global checkpoint saved mid-run, 'crash', resume."""
+        cp = make_global_checkpoint(
+            last_message_id=1500, processed_count=300,
+            started_at="2026-07-25T10:00:00Z",
+        )
+        save_global_checkpoint(cp_dir, cp)
+
+        loaded = load_global_checkpoint(cp_dir)
+        assert loaded is not None
+        assert loaded.last_message_id == 1500
+
+        # Caller skips messages with message_id <= 1500
+        pending = [{"id": 1499}, {"id": 1500}, {"id": 1501}, {"id": 1502}]
+        to_process = [m for m in pending if m["id"] > loaded.last_message_id]
+        assert [m["id"] for m in to_process] == [1501, 1502]
+
+        delete_global_checkpoint(cp_dir)
+        assert load_global_checkpoint(cp_dir) is None
