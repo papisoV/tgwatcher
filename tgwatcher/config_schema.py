@@ -36,7 +36,8 @@ KNOWN_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "signal": ("enabled", "llm", "dedup", "filter", "batch_size",
                "llm_batch_size", "llm_delay", "factor_version", "keywords"),
     "signal_llm": ("provider", "providers", "timeout_connect", "timeout_read",
-                   "timeout_write", "timeout_pool", "max_retries"),
+                   "timeout_write", "timeout_pool", "max_retries",
+                   "max_batch_size", "checkpoint_dir"),
     "crawl": ("interval_minutes", "limit", "max_delay", "min_delay", "mode"),
     "proxy": ("enabled", "host", "port", "protocol"),
     "timezone": ("utc_offset_hours",),
@@ -56,6 +57,8 @@ KNOWN_TYPOS: dict[str, str] = {
     "max_tokens_btach": "max_tokens_batch",
     "max_tokens_bach": "max_tokens_batch",
     "interval_seconds": "poll_interval_seconds",
+    "max_batch": "max_batch_size",
+    "batch_size": "llm_batch_size",  # signal.batch_size exists, but at signal.llm level this is the wrong key
 }
 
 
@@ -181,6 +184,25 @@ def validate_config(config: dict) -> list[str]:
                         errors.append(
                             "'signal.llm.provider' must be a string "
                             "(provider name)."
+                        )
+                    # max_batch_size — optional positive int for batch checkpoint
+                    mbs = sig_llm.get("max_batch_size")
+                    if mbs is not None:
+                        if not isinstance(mbs, int) or isinstance(mbs, bool):
+                            errors.append(
+                                "'signal.llm.max_batch_size' must be an int "
+                                "(positive, optional)."
+                            )
+                        elif mbs <= 0:
+                            errors.append(
+                                "'signal.llm.max_batch_size' must be > 0."
+                            )
+                    # checkpoint_dir — optional string path for batch checkpoint JSONs
+                    cdir = sig_llm.get("checkpoint_dir")
+                    if cdir is not None and not isinstance(cdir, str):
+                        errors.append(
+                            "'signal.llm.checkpoint_dir' must be a string "
+                            "(path, optional)."
                         )
                     if providers is not None:
                         if not _is_dict(providers):

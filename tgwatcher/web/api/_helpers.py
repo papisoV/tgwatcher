@@ -81,20 +81,50 @@ def _check_rate_limit(key: str, max_requests: int = 5, window: int = 60) -> bool
 
 # ── Auth helpers (depend on _app_state.auth_token) ─────────────────────
 def _extract_auth_token() -> str:
-    """Extract bearer token from Authorization header, falling back to ?token=.
+    """Extract auth token from Authorization header, cookie, or ?token=.
 
-    Emits a deprecation warning when the query-string fallback is used (and
-    auth is enforced). Returns the raw token string ("" if absent). Callers
+    Priority: Authorization header > auth_token cookie > ?token= query string.
+    The query-string fallback is deprecated (leaks token in URLs/logs) and
+    emits a warning when used. Cookie auth enables native EventSource which
+    cannot set headers. Returns the raw token string ("" if absent). Callers
     perform the actual equality check against `_app_state.auth_token`.
     """
     from tgwatcher.web.api import _app_state  # real module attribute (singleton)
     auth_token = _app_state.auth_token
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if not token:
-        token = request.args.get("token", "")
-        if token and auth_token:
-            logger.warning("Query-string auth via ?token= is deprecated; use Authorization header")
-    return token
+    if token:
+        return token
+    cookie = request.cookies.get("auth_token", "")
+    if cookie:
+        return cookie
+    qs_token = request.args.get("token", "")
+    if qs_token and auth_token:
+        logger.warning("Query-string auth via ?token= is deprecated; use Authorization header or cookie")
+        return qs_token
+    return ""
+
+
+def _set_auth_cookie(resp, token: str) -> None:
+    """Set auth_token cookie with secure attributes on a Flask response.
+
+    HttpOnly blocks JS access (XSS theft), SameSite=Strict blocks CSRF,
+    Path=/api minimizes cookie scope to API endpoints only, Max-Age=86400
+    gives 24h lifetime. Secure flag set when request is HTTPS.
+    """
+    resp.set_cookie(
+        "auth_token",
+        token,
+        httponly=True,
+        samesite="Strict",
+        path="/api",
+        max_age=86400,
+        secure=request.is_secure,
+    )
+
+
+def _clear_auth_cookie(resp) -> None:
+    """Clear auth_token cookie (logout)."""
+    resp.delete_cookie("auth_token", path="/api")
 
 
 def require_auth(f):

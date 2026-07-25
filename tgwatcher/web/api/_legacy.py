@@ -14,10 +14,10 @@ from tgwatcher.web.auto_poll_daemon import AutoPollDaemon
 from tgwatcher.web.listener_daemon import ListenerDaemon
 from tgwatcher.web.sse_bus import SSEBus
 from ._helpers import (  # noqa: F401
-    _atomic_write_config, _check_rate_limit, _disconnect_tg_client,
-    _extract_auth_token, _get_auth_token_path, _get_listen_groups,
-    _get_tg_client, _iso_z, _rate_limit_store, _run_coro, _tg_client_guard,
-    require_auth,
+    _atomic_write_config, _check_rate_limit, _clear_auth_cookie,
+    _disconnect_tg_client, _extract_auth_token, _get_auth_token_path,
+    _get_listen_groups, _get_tg_client, _iso_z, _rate_limit_store,
+    _run_coro, _set_auth_cookie, _tg_client_guard, require_auth,
 )
 from ._proxies import (  # noqa: F401
     _AutoPollLockProxy, _AutoPollShutdownProxy, _AutoPollStateProxy,

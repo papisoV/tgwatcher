@@ -5,12 +5,14 @@ Sub-blueprint registered under the parent `api` blueprint.
 """
 import logging
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, make_response, request
 
 from ._legacy import (
     _app_state,
     _check_rate_limit,
+    _clear_auth_cookie,
     _run_coro,
+    _set_auth_cookie,
     _tg_client_guard,
 )
 
@@ -40,7 +42,9 @@ def auth_bootstrap():
     if ip not in loopback:
         return jsonify({"error": "Forbidden"}), 403
 
-    return jsonify({"token": auth_token})
+    resp = make_response(jsonify({"token": auth_token}))
+    _set_auth_cookie(resp, auth_token)
+    return resp
 
 
 @bp.route("/login/status", methods=["GET"])
@@ -92,12 +96,18 @@ def do_login():
             authorized = _run_coro(tg.client.is_user_authorized())
 
             if authorized:
-                return jsonify({"status": "already_logged_in"})
+                resp = make_response(jsonify({"status": "already_logged_in"}))
+                if _app_state.auth_token is not None:
+                    _set_auth_cookie(resp, _app_state.auth_token)
+                return resp
 
             if code and phone_code_hash:
                 try:
                     _run_coro(tg.client.sign_in(phone, code, phone_code_hash=phone_code_hash))
-                    return jsonify({"status": "logged_in"})
+                    resp = make_response(jsonify({"status": "logged_in"}))
+                    if _app_state.auth_token is not None:
+                        _set_auth_cookie(resp, _app_state.auth_token)
+                    return resp
                 except Exception as e:
                     return jsonify({"error": str(e)}), 400
             else:
@@ -110,3 +120,11 @@ def do_login():
     except Exception as e:
         logger.error("Login error: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/logout", methods=["POST"])
+def do_logout():
+    """Clear auth cookie. Stateless — no server-side session to invalidate."""
+    resp = make_response(jsonify({"ok": True}))
+    _clear_auth_cookie(resp)
+    return resp

@@ -74,6 +74,12 @@ signal:
     timeout_write: 30
     timeout_pool: 10
     max_retries: 3
+    # Batch checkpoint/resume — crash-safe LLM batch processing.
+    # When max_batch_size is set, the batch loop saves a checkpoint JSON
+    # to checkpoint_dir every N successful LLM calls. On crash/restart,
+    # the batch resumes from the checkpoint instead of restarting from 0.
+    # max_batch_size: 50          # save checkpoint every N calls (omit = no checkpointing)
+    # checkpoint_dir: ./batch_checkpoints  # directory for checkpoint JSON files
     # Env overrides (optional):
     #   SIGNAL_LLM_API_KEY — overrides active provider's api_key (OpenAI-protocol)
     #   ANTHROPIC_API_KEY  — overrides anthropic provider's api_key
