@@ -104,4 +104,12 @@ signal:
 
 ## License
 
-MIT
+MIT — 见 [LICENSE](LICENSE)
+
+### Third-Party Assets
+
+- [Chart.js v4.5.1](https://www.chartjs.org) — MIT License (bundled in `tgwatcher/web/static/chart.min.js`)
+- [Inter](https://github.com/rsms/inter) — SIL Open Font License 1.1 (bundled in `tgwatcher/web/static/fonts/Inter-*.woff2`)
+- [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) — SIL Open Font License 1.1 (bundled in `tgwatcher/web/static/fonts/JetBrainsMono-*.woff2`)
+
+Font license text: [`tgwatcher/web/static/fonts/OFL.txt`](tgwatcher/web/static/fonts/OFL.txt)

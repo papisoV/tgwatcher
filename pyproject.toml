@@ -2,6 +2,9 @@
 name = "tgwatcher"
 version = "1.0.0"
 description = "Telegram group message crawler with web management panel"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "papisoV"}]
 requires-python = ">=3.11"
 dependencies = [
     "telethon>=1.37.0",
