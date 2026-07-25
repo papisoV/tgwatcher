@@ -171,6 +171,24 @@ class AutoLlmDaemon:
                 )
                 return
 
+        # Acquire the shared digest lock — non-blocking. If the user clicked
+        # "generate digest" on the web UI at the same moment, skip this run;
+        # the 60min rate limit will trigger another attempt next tick.
+        try:
+            from tgwatcher.web.api.routes_digest import _digest_lock
+        except Exception:
+            _digest_lock = None  # routes_digest not importable — proceed unlocked
+
+        acquired = False
+        if _digest_lock is not None:
+            try:
+                acquired = _digest_lock.acquire(blocking=False)
+            except Exception:
+                acquired = False
+            if not acquired:
+                logger.info("Auto-digest: skipping (another generation in progress)")
+                return
+
         try:
             from tgwatcher.digest import generate_digest
             result = generate_digest(self._storage, self._engine._llm)
@@ -189,6 +207,12 @@ class AutoLlmDaemon:
         except Exception as e:
             logger.exception("Auto-digest failed: %s", e)
             self._push_sse("digest_error", {"error": str(e)})
+        finally:
+            if acquired and _digest_lock is not None:
+                try:
+                    _digest_lock.release()
+                except Exception:
+                    pass
 
     # --- helpers ---
     def _count_pending(self) -> int:

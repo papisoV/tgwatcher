@@ -115,9 +115,16 @@ def _fetch_signals(storage: Storage, from_at: datetime, to_at: datetime) -> list
     """
     import sqlite3
     db_path = _resolve_db_path(storage)
-    con = sqlite3.connect(db_path)
+    # Use a short-lived connection with 30s busy_timeout to coexist with
+    # concurrent writers (auto-poll crawl, auto-llm batch). Without this,
+    # the default busy_timeout=0 means immediate "database is locked" on
+    # any concurrent write transaction.
+    con = sqlite3.connect(db_path, timeout=30)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
+    # Set busy_timeout on this connection too — defense in depth. timeout
+    # arg sets it for the connection, but PRAGMA makes it explicit.
+    cur.execute("PRAGMA busy_timeout=30000")
     cur.execute(
         """
         SELECT sf.message_id, sf.direction, sf.magnitude, sf.urgency,
