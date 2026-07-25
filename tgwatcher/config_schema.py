@@ -34,7 +34,8 @@ KNOWN_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "groups": ("id", "name", "username", "auto_catchup", "auto_poll",
                "poll_interval_seconds", "auto_listen"),
     "signal": ("enabled", "llm", "dedup", "filter", "batch_size",
-               "llm_batch_size", "llm_delay", "factor_version", "keywords"),
+               "llm_batch_size", "llm_delay", "factor_version", "keywords",
+               "auto_llm", "auto_digest_interval_minutes", "auto_llm_min_signals"),
     "signal_llm": ("provider", "providers", "timeout_connect", "timeout_read",
                    "timeout_write", "timeout_pool", "max_retries",
                    "max_batch_size", "checkpoint_dir"),
@@ -59,6 +60,10 @@ KNOWN_TYPOS: dict[str, str] = {
     "interval_seconds": "poll_interval_seconds",
     "max_batch": "max_batch_size",
     "batch_size": "llm_batch_size",  # signal.batch_size exists, but at signal.llm level this is the wrong key
+    "auto_llm_interval": "auto_digest_interval_minutes",
+    "auto_llm_interval_minutes": "auto_digest_interval_minutes",
+    "auto_digest_interval": "auto_digest_interval_minutes",
+    "auto_llm_min_signal": "auto_llm_min_signals",
 }
 
 
@@ -165,6 +170,29 @@ def validate_config(config: dict) -> list[str]:
                 errors.append("'signal.enabled' must be a bool.")
             else:
                 signal_enabled = se
+
+            # auto_llm — chain LLM+digest after crawl (default: True when signal enabled)
+            al = signal.get("auto_llm")
+            if al is not None and not isinstance(al, bool):
+                errors.append("'signal.auto_llm' must be a bool.")
+
+            # auto_digest_interval_minutes — rate limit for digest generation
+            adi = signal.get("auto_digest_interval_minutes")
+            if adi is not None:
+                if not isinstance(adi, int) or adi < 0:
+                    errors.append(
+                        "'signal.auto_digest_interval_minutes' must be a "
+                        "non-negative int (0 disables auto-digest)."
+                    )
+
+            # auto_llm_min_signals — skip LLM batch if pending < this
+            ms = signal.get("auto_llm_min_signals")
+            if ms is not None:
+                if not isinstance(ms, int) or ms < 0:
+                    errors.append(
+                        "'signal.auto_llm_min_signals' must be a "
+                        "non-negative int."
+                    )
 
             # signal.llm (nested) — provider credentials.
             sig_llm = signal.get("llm")

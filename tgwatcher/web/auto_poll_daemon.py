@@ -48,11 +48,24 @@ class AutoPollDaemon:
         # SSE push callback wired in by api.py (avoids circular import).
         # When None, the loop skips SSE push for auto_poll_tick events.
         self._push_sse_event: Any = None
+        # Auto-LLM daemon — wired in by api.py at init_services time.
+        # When set, trigger_after_crawl() is called after each successful
+        # crawl tick so LLM batch + digest run chain-style.
+        self._auto_llm_daemon: Any = None
 
     # --- dependency injection ---
     def set_crawl_service(self, crawl_service: Any) -> None:
         """Wire in the CrawlService instance (called by init_services)."""
         self._crawl_service = crawl_service
+
+    def set_auto_llm_daemon(self, daemon: Any) -> None:
+        """Wire in the AutoLlmDaemon instance (called by init_services).
+
+        When set, each successful crawl tick triggers
+        daemon.trigger_after_crawl() so the LLM batch + digest chain runs
+        immediately after crawl completion.
+        """
+        self._auto_llm_daemon = daemon
 
     # --- lifecycle hooks (replace module-level functions) ---
     def init_from_config(self, config: dict) -> None:
@@ -127,6 +140,14 @@ class AutoPollDaemon:
                         cs.start(mode="incremental", group_id=cid)
                 except Exception as e:
                     logger.warning("Auto-poll crawl start failed", extra={"chat_id": cid, "error": str(e)})
+                # Chain to auto-LLM daemon — triggers LLM batch + digest
+                # after crawl completes. Safe to call even if daemon is None
+                # or crawl start failed (LLM would just find no new pending).
+                if self._auto_llm_daemon is not None:
+                    try:
+                        self._auto_llm_daemon.trigger_after_crawl()
+                    except Exception as e:
+                        logger.warning("Auto-poll trigger_after_crawl failed: %s", e)
                 # SSE push is performed by api.py via the push_sse_event shim —
                 # call the bound callback if set. We avoid importing push_sse_event
                 # directly to keep this module decoupled from the SSE bus.

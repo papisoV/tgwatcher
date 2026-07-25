@@ -17,7 +17,7 @@ function switchTab(tab){
   if(tab==='dashboard')loadDashboardTab();
   if(tab==='groups')loadGroupsView();
   if(tab==='signal')loadSignalTab();
-  if(tab==='digest')loadDigestTab();
+  if(tab==='digest'){loadDigestTab();clearDigestUpdateFlag();}
 }
 
 async function loadDigestTab(){

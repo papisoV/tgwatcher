@@ -142,6 +142,32 @@ class AppState:
         _api._init_auto_poll(config)
         threading.Thread(target=_api._auto_poll_loop, daemon=True, name="auto-poll").start()
 
+        # Auto-LLM daemon — chains LLM batch + digest after each crawl tick.
+        # Started only if signal.enabled (LLM client exists) and signal.auto_llm
+        # is not explicitly False (default True when signal.enabled).
+        if self.signal_engine is not None and signal_cfg.get("auto_llm", True):
+            from tgwatcher.web.auto_llm_daemon import AutoLlmDaemon
+            self.auto_llm_daemon = AutoLlmDaemon(
+                storage=self.storage,
+                signal_engine=self.signal_engine,
+                push_sse_event=_api.push_sse_event,
+                digest_interval_minutes=signal_cfg.get("auto_digest_interval_minutes", 60),
+                min_signals=signal_cfg.get("auto_llm_min_signals", 5),
+            )
+            _api._auto_poll_daemon.set_auto_llm_daemon(self.auto_llm_daemon)
+            threading.Thread(
+                target=self.auto_llm_daemon.run_loop,
+                daemon=True,
+                name="auto-llm",
+            ).start()
+            logger.info(
+                "Auto-LLM daemon started (digest_interval=%dmin, min_signals=%d)",
+                signal_cfg.get("auto_digest_interval_minutes", 60),
+                signal_cfg.get("auto_llm_min_signals", 5),
+            )
+        else:
+            self.auto_llm_daemon = None
+
         # Register process-lifecycle shutdown for the auto-poll daemon.
         # atexit covers normal interpreter exit (Ctrl+C, sys.exit). SIGTERM covers
         # container/production signals. signal.signal must be in the main thread —
@@ -152,6 +178,8 @@ class AppState:
 
         def _shutdown_daemons(*_):
             _api._auto_poll_shutdown.set()
+            if self.auto_llm_daemon is not None:
+                self.auto_llm_daemon.signal_shutdown()
 
         atexit.register(_shutdown_daemons)
         try:
