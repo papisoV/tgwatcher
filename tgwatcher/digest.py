@@ -26,27 +26,30 @@ from tgwatcher.tz_utils import utc_now, utc_to_local, local_to_utc
 
 logger = logging.getLogger(__name__)
 
-COLD_START_HOURS = 36
-MAX_WINDOW_HOURS = 36          # if last_digest_at is older, cap to 36h
+COLD_START_HOURS = 36        # first-ever digest: 36h (no need for full 7d)
+WINDOW_HOURS = 168           # 7 days — half-life weighting handles aging beyond 36h
+MAX_WINDOW_HOURS = 168      # cap for incremental digest (last_digest.to_at → now)
 MIN_SIGNALS_FOR_SUMMARY = 5    # below this, skip LLM and return "no change"
+DEFAULT_HALFLIFE_MIN = 60    # fallback when signal's halflife_min is None/0
 
 DIGEST_PROMPT_TEMPLATE = """你是一个加密货币市场分析师。基于以下结构化信号数据，写一份简洁的中文市场摘要。
 
-数据时间窗口：{from_at} 到 {to_at}（本地时间）
+数据时间窗口：{from_at} 到 {to_at}（本地时间，7 天窗口，半衰期加权）
 信号总数：{total}
+总权重（市场活跃度指标）：{total_weight:.2f}
 
-聚合统计：
+聚合统计（半衰期加权 — 越新越重要，老消息按 0.5^(age/halflife) 衰退）：
 - 净方向分：{net_direction:+.2f}（-1=全空，0=中性，+1=全多）
-- 平均置信度：{avg_confidence:.2f}
-- 平均幅度：{avg_magnitude:.2f}
+- 加权平均置信度：{avg_confidence:.2f}
+- 加权平均幅度：{avg_magnitude:.2f}
 
-按事件类型分组：
+按事件类型分组（按总权重降序）：
 {event_type_breakdown}
 
-按标的分组（top 5）：
+按标的分组（top 5，按总权重降序）：
 {symbols_breakdown}
 
-高置信事件（confidence >= 0.8，按时间倒序）：
+高权重事件（weight × confidence 排序，含半衰期权重 w）：
 {high_confidence_events}
 
 请输出以下格式（纯文本，不要 markdown 代码块）：
@@ -55,10 +58,10 @@ DIGEST_PROMPT_TEMPLATE = """你是一个加密货币市场分析师。基于以�
 一句话总结净方向 + 驱动因素
 
 【重点事件】
-2-4 条最值得关注的事件，每条包含：时间、标的、方向、一句话原因
+2-4 条最值得关注的事件，每条包含：时间、标的、方向、一句话原因。优先选择 w 较高的近期事件。
 
 【风险提示】
-1-2 条仍未消化的风险（halflife_min 较长的利空事件）
+1-2 条仍未消化的风险（halflife_min 较长的利空事件，即使发生时间较早 w 仍较高）
 
 【一句话展望】
 对接下来 12 小时的简短判断
@@ -104,7 +107,12 @@ def _compute_window(storage: Storage) -> tuple[datetime, datetime]:
 
 
 def _fetch_signals(storage: Storage, from_at: datetime, to_at: datetime) -> list[dict]:
-    """Fetch is_signal=1 rows in [from_at, to_at] (UTC, naive)."""
+    """Fetch is_signal=1 rows in [from_at, to_at] (UTC, naive).
+
+    JOINs messages to filter by message time (not LLM processing time) —
+    a message crawled today but originally sent 2 days ago must NOT
+    contaminate the "last 36h" window just because LLM ran today.
+    """
     import sqlite3
     db_path = _resolve_db_path(storage)
     con = sqlite3.connect(db_path)
@@ -112,12 +120,16 @@ def _fetch_signals(storage: Storage, from_at: datetime, to_at: datetime) -> list
     cur = con.cursor()
     cur.execute(
         """
-        SELECT message_id, direction, magnitude, urgency, confidence,
-               halflife_min, symbols, event_type, reasoning, created_at
-        FROM signal_factors
-        WHERE is_signal = 1 AND llm_status = 'completed'
-          AND created_at > ? AND created_at <= ?
-        ORDER BY created_at DESC
+        SELECT sf.message_id, sf.direction, sf.magnitude, sf.urgency,
+               sf.confidence, sf.halflife_min, sf.symbols, sf.event_type,
+               sf.reasoning, sf.created_at,
+               m.date AS message_date
+        FROM signal_factors sf
+        JOIN messages m ON sf.message_id = m.message_id
+                       AND sf.chat_id = m.chat_id
+        WHERE sf.is_signal = 1 AND sf.llm_status = 'completed'
+          AND m.date > ? AND m.date <= ?
+        ORDER BY m.date DESC
         """,
         (from_at.isoformat(), to_at.isoformat()),
     )
@@ -133,55 +145,84 @@ def _resolve_db_path(storage: Storage) -> str:
     return url.replace("sqlite:///", "", 1)
 
 
+def _signal_weight(signal: dict, now: datetime) -> float:
+    """计算信号权重 = 0.5^(age_minutes / halflife_min)。
+
+    age=0 → 1.0, age=halflife → 0.5, age=2*halflife → 0.25, etc.
+    Falls back to created_at when message_date missing (defensive —
+    _fetch_signals always JOINs messages, but legacy data may lack it).
+    """
+    msg_date = signal.get("message_date") or signal.get("created_at")
+    if isinstance(msg_date, str):
+        msg_date = datetime.fromisoformat(msg_date)
+    age_minutes = (now - msg_date).total_seconds() / 60.0
+    halflife = signal.get("halflife_min") or DEFAULT_HALFLIFE_MIN
+    if halflife <= 0:
+        halflife = DEFAULT_HALFLIFE_MIN
+    return 0.5 ** (age_minutes / halflife)
+
+
 def _aggregate(signals: list[dict], from_at: datetime, to_at: datetime) -> dict:
-    """Compute aggregate stats from signal list."""
+    """Compute half-life weighted aggregate stats from signal list.
+
+    Weighting: each signal contributes 0.5^(age/halflife) to averages —
+    newer signals and longer-half-life signals (regulatory, macro) carry
+    more weight than stale or short-half-life ones (market noise).
+    """
     if not signals:
         return {"empty": True}
 
     total = len(signals)
-    directions = [s["direction"] for s in signals]
-    confidences = [s["confidence"] for s in signals]
-    magnitudes = [s["magnitude"] for s in signals]
+    now = utc_now().replace(tzinfo=None)
+    weights = [_signal_weight(s, now) for s in signals]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        total_weight = 1.0  # defensive — shouldn't happen
 
-    net_direction = sum(directions) / total
-    avg_conf = sum(confidences) / total
-    avg_mag = sum(magnitudes) / total
+    w_dir = sum(w * s["direction"] for w, s in zip(weights, signals)) / total_weight
+    w_conf = sum(w * s["confidence"] for w, s in zip(weights, signals)) / total_weight
+    w_mag = sum(w * s["magnitude"] for w, s in zip(weights, signals)) / total_weight
 
-    by_type: dict[str, list[dict]] = defaultdict(list)
-    for s in signals:
-        by_type[s["event_type"]].append(s)
+    by_type: dict[str, list[tuple[float, dict]]] = defaultdict(list)
+    for s, w in zip(signals, weights):
+        by_type[s["event_type"]].append((w, s))
 
     event_type_lines = []
-    for et, items in sorted(by_type.items(), key=lambda x: -len(x[1])):
-        avg_dir = sum(i["direction"] for i in items) / len(items)
+    for et, items in sorted(by_type.items(), key=lambda x: -sum(w for w, _ in x[1])):
+        type_total_w = sum(w for w, _ in items)
+        type_w_dir = sum(w * s["direction"] for w, s in items) / type_total_w
         event_type_lines.append(
-            f"  - {et}: {len(items)} 条, 平均方向 {avg_dir:+.2f}"
+            f"  - {et}: {len(items)} 条, 加权方向 {type_w_dir:+.2f}, 总权重 {type_total_w:.2f}"
         )
 
-    by_symbol: dict[str, list[dict]] = defaultdict(list)
-    for s in signals:
+    by_symbol: dict[str, list[tuple[float, dict]]] = defaultdict(list)
+    for s, w in zip(signals, weights):
         try:
             syms = json.loads(s["symbols"]) if s["symbols"] else ["*"]
         except (json.JSONDecodeError, TypeError):
             syms = ["*"]
         for sym in syms:
-            by_symbol[sym].append(s)
+            by_symbol[sym].append((w, s))
 
     symbol_lines = []
-    for sym, items in sorted(by_symbol.items(), key=lambda x: -len(x[1]))[:5]:
-        avg_dir = sum(i["direction"] for i in items) / len(items)
+    for sym, items in sorted(by_symbol.items(), key=lambda x: -sum(w for w, _ in x[1]))[:5]:
+        sym_total_w = sum(w for w, _ in items)
+        sym_w_dir = sum(w * s["direction"] for w, s in items) / sym_total_w
         symbol_lines.append(
-            f"  - {sym}: {len(items)} 条, 平均方向 {avg_dir:+.2f}"
+            f"  - {sym}: {len(items)} 条, 加权方向 {sym_w_dir:+.2f}, 总权重 {sym_total_w:.2f}"
         )
 
-    high_conf = sorted(
-        [s for s in signals if s["confidence"] >= 0.8],
-        key=lambda s: s["created_at"],
+    # 高权重事件 — 按 weight × confidence 排序（时效性 × 重要性）
+    ranked = sorted(
+        signals,
+        key=lambda s: _signal_weight(s, now) * s["confidence"],
         reverse=True,
     )[:8]
     high_conf_lines = []
-    for s in high_conf:
-        time_str = str(s["created_at"])[5:16].replace("T", " ")
+    for s in ranked:
+        w = _signal_weight(s, now)
+        msg_date = s.get("message_date") or s.get("created_at")
+        time_str = str(msg_date)[5:16].replace("T", " ")
         try:
             syms = json.loads(s["symbols"]) if s["symbols"] else ["*"]
             sym_str = "/".join(syms)
@@ -190,7 +231,7 @@ def _aggregate(signals: list[dict], from_at: datetime, to_at: datetime) -> dict:
         reasoning = (s["reasoning"] or "")[:100]
         high_conf_lines.append(
             f"  - {time_str} [{sym_str}] dir={s['direction']:+.1f} "
-            f"conf={s['confidence']:.2f} ({s['event_type']}): {reasoning}"
+            f"conf={s['confidence']:.2f} w={w:.2f} ({s['event_type']}): {reasoning}"
         )
 
     from_local = utc_to_local(from_at).strftime("%Y-%m-%d %H:%M")
@@ -201,9 +242,10 @@ def _aggregate(signals: list[dict], from_at: datetime, to_at: datetime) -> dict:
         "from_at": from_local,
         "to_at": to_local,
         "total": total,
-        "net_direction": net_direction,
-        "avg_confidence": avg_conf,
-        "avg_magnitude": avg_mag,
+        "total_weight": total_weight,
+        "net_direction": w_dir,
+        "avg_confidence": w_conf,
+        "avg_magnitude": w_mag,
         "event_type_breakdown": "\n".join(event_type_lines) or "  (无)",
         "symbols_breakdown": "\n".join(symbol_lines) or "  (无)",
         "high_confidence_events": "\n".join(high_conf_lines) or "  (无)",
