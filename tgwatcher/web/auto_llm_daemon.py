@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from tgwatcher.tz_utils import utc_now
@@ -63,8 +63,12 @@ class AutoLlmDaemon:
 
         self._trigger_event = threading.Event()
         self._shutdown = threading.Event()
+        self._running = threading.Event()  # set while run_loop is alive
         self._thread: threading.Thread | None = None
         self._last_digest_at: datetime | None = None
+        self._last_batch_at: datetime | None = None
+        self._last_batch_count: int | None = None
+        self._status_lock = threading.Lock()
 
     # --- dependency injection ---
     def set_sse_push_callback(self, callback: Any) -> None:
@@ -101,19 +105,23 @@ class AutoLlmDaemon:
             "Auto-LLM daemon started (digest_interval=%s, min_signals=%d)",
             self._digest_interval, self._min_signals,
         )
-        while not self._shutdown.is_set():
-            # Wait for trigger or 60min timeout (fallback for listener-pushed msgs)
-            triggered = self._trigger_event.wait(timeout=60)
-            if self._shutdown.is_set():
-                break
-            self._trigger_event.clear()
-            try:
-                self._run_llm_batch()
-                if not self._shutdown.is_set():
-                    self._maybe_generate_digest()
-            except Exception as e:
-                logger.exception("Auto-LLM loop error: %s", e)
-                self._push_sse("llm_batch_error", {"error": str(e)})
+        self._running.set()
+        try:
+            while not self._shutdown.is_set():
+                # Wait for trigger or 60min timeout (fallback for listener-pushed msgs)
+                triggered = self._trigger_event.wait(timeout=60)
+                if self._shutdown.is_set():
+                    break
+                self._trigger_event.clear()
+                try:
+                    self._run_llm_batch()
+                    if not self._shutdown.is_set():
+                        self._maybe_generate_digest()
+                except Exception as e:
+                    logger.exception("Auto-LLM loop error: %s", e)
+                    self._push_sse("llm_batch_error", {"error": str(e)})
+        finally:
+            self._running.clear()
 
     def _run_llm_batch(self) -> None:
         """Run SignalEngine.process_batch on all pending messages.
@@ -122,7 +130,7 @@ class AutoLlmDaemon:
         Pushes llm_batch_start / llm_batch_done SSE events.
         """
         # Count pending — skip if too few
-        pending_count = self._count_pending()
+        pending_count = self.count_pending()
         if pending_count < self._min_signals:
             logger.info(
                 "Auto-LLM: skipping (pending=%d < min=%d)",
@@ -138,6 +146,10 @@ class AutoLlmDaemon:
             stop_check=self._shutdown.is_set,
         )
         duration_ms = int((time.time() - t0) * 1000)
+
+        with self._status_lock:
+            self._last_batch_at = utc_now().replace(tzinfo=None)
+            self._last_batch_count = result.completed
 
         self._push_sse("llm_batch_done", {
             "total": result.total,
@@ -215,7 +227,7 @@ class AutoLlmDaemon:
                     pass
 
     # --- helpers ---
-    def _count_pending(self) -> int:
+    def count_pending(self) -> int:
         """Count signal_factors rows with llm_status='pending'.
 
         Uses storage facade's session to query directly. Returns 0 on error
@@ -248,3 +260,30 @@ class AutoLlmDaemon:
     def set_last_digest_at(self, ts: datetime) -> None:
         """Test hook — pretend a digest was generated at this time."""
         self._last_digest_at = ts
+
+    def get_status(self) -> dict:
+        """Snapshot of daemon state for /api/signal/daemon.
+
+        All five fields are read under _status_lock for a consistent view.
+        Datetime fields are formatted as ISO UTC with 'Z' suffix; None if
+        no batch / digest has run yet.
+        """
+        with self._status_lock:
+            last_batch_at = self._last_batch_at
+            last_batch_count = self._last_batch_count
+            last_digest_at = self._last_digest_at
+        running = self._running.is_set() and not self._shutdown.is_set()
+        pending = self.count_pending()
+
+        def _iso_z(ts: datetime | None) -> str | None:
+            if ts is None:
+                return None
+            return ts.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+        return {
+            "running": running,
+            "pending": pending,
+            "last_batch_at": _iso_z(last_batch_at),
+            "last_batch_count": last_batch_count,
+            "last_digest_at": _iso_z(last_digest_at),
+        }

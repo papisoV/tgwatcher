@@ -8,6 +8,10 @@
 //   - loadSignalTab (signal.js)
 
 function switchTab(tab){
+  if(tab!=='signal' && _daemonStatusInterval){
+    clearInterval(_daemonStatusInterval);
+    _daemonStatusInterval=null;
+  }
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
   document.getElementById('viewMessages').classList.toggle('active',tab==='messages');
   document.getElementById('viewDashboard').classList.toggle('active',tab==='dashboard');

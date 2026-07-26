@@ -21,6 +21,7 @@ Routes moved (13 total):
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 
 from flask import Blueprint, jsonify, request, Response
@@ -33,20 +34,51 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("signals", __name__, url_prefix="")
 
+_signal_lock = threading.Lock()
+
 
 @bp.route("/signal/process", methods=["POST"])
 @require_auth
 def signal_process():
-    """Start batch signal processing."""
+    """Start batch signal processing.
+
+    Returns 409 with {"error": "Signal processing already running"} if the
+    SignalService reports it is already running, OR 409 with
+    {"error": "already running", "lock": "signal"} if another caller holds
+    the per-route _signal_lock (e.g. concurrent HTTP request).
+    """
     if not _app_state.signal_service:
         return jsonify({"error": "Signal processing not enabled"}), 400
-    body = request.get_json(silent=True) or {}
-    chat_id = body.get("chat_id")
-    overwrite = body.get("overwrite", False)
-    started = _app_state.signal_service.start(chat_id=chat_id, overwrite=overwrite)
-    if not started:
-        return jsonify({"error": "Signal processing already running"}), 409
-    return jsonify({"status": "started"})
+    acquired = _signal_lock.acquire(blocking=False)
+    if not acquired:
+        return jsonify({"error": "already running", "lock": "signal"}), 409
+    try:
+        body = request.get_json(silent=True) or {}
+        chat_id = body.get("chat_id")
+        overwrite = body.get("overwrite", False)
+        started = _app_state.signal_service.start(chat_id=chat_id, overwrite=overwrite)
+        if not started:
+            return jsonify({"error": "Signal processing already running"}), 409
+        return jsonify({"status": "started"})
+    finally:
+        _signal_lock.release()
+
+
+@bp.route("/signal/daemon", methods=["GET"])
+@require_auth
+def signal_daemon_status():
+    """Get AutoLlmDaemon status: running, pending, last_batch_at,
+    last_batch_count, last_digest_at.
+
+    Returns zeros/None if daemon not initialized.
+    """
+    daemon = getattr(_app_state, "auto_llm_daemon", None) if _app_state else None
+    if daemon is None:
+        return jsonify({
+            "running": False, "pending": 0,
+            "last_batch_at": None, "last_batch_count": None, "last_digest_at": None
+        })
+    return jsonify(daemon.get_status())
 
 
 @bp.route("/signal/process/status", methods=["GET"])

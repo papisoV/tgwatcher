@@ -5,6 +5,9 @@
 //   - api (api-client.js)
 //   - esc, fmtTime (utils.js)
 
+let _daemonStatusInterval=null;
+let _daemonFailCount=0;
+
 async function loadSignalTab(){
   const s=await api('/api/signal/stats');if(!s)return;
   const total=s.total||0;
@@ -18,7 +21,7 @@ async function loadSignalTab(){
   loadSignalTrendChart();
   loadSignalEventChart(s.event_types||{});
   loadSignalTable();
-  checkSignalStatus();
+  checkDaemonStatus();
 }
 
 async function loadSignalTrendChart(){
@@ -90,33 +93,32 @@ async function loadSignalTable(){
   }).join('');
 }
 
-async function startSignalProcess(){
-  const r=await api('/api/signal/process','POST',{});if(!r)return;
-  document.getElementById('btnSignalProcess').style.display='none';
-  document.getElementById('btnSignalStop').style.display='';
-  document.getElementById('signalProgress').textContent='处理中...';
-}
-
-async function stopSignalProcess(){
-  await api('/api/signal/process/stop','POST');
-  document.getElementById('btnSignalProcess').style.display='';
-  document.getElementById('btnSignalStop').style.display='none';
-}
-
-async function checkSignalStatus(){
-  const s=await api('/api/signal/process/status');if(!s)return;
-  if(s.running){
-    document.getElementById('btnSignalProcess').style.display='none';
-    document.getElementById('btnSignalStop').style.display='';
-    const pct=s.total?Math.round(s.processed/s.total*100):0;
-    document.getElementById('signalProgress').textContent=`${s.processed||0}/${s.total||0} (${pct}%)`;
-  }else{
-    document.getElementById('btnSignalProcess').style.display='';
-    document.getElementById('btnSignalStop').style.display='none';
-    if(s.processed>0){
-      document.getElementById('signalProgress').textContent=`完成: ${s.completed||0} 完成, ${s.failed||0} 失败, ${s.skipped||0} 跳过`;
-    }else{
-      document.getElementById('signalProgress').textContent='';
+async function checkDaemonStatus(){
+  try{
+    const s=await api('/api/signal/daemon');
+    if(!s){ _daemonFailCount++; if(_daemonFailCount>=3){ const pill=document.getElementById('signalDaemonPill'); if(pill){ pill.textContent='daemon: 错误 — 见日志'; pill.style.background='#ff3d7120'; } } return; }
+    _daemonFailCount=0;
+    const pill=document.getElementById('signalDaemonPill'); if(!pill)return;
+    let text, bg;
+    if(s.running){
+      text=`daemon: 处理中 ${s.pending||0} 条`;
+      bg='#00ff8820';
+    } else if(s.last_batch_at){
+      const t=(s.last_batch_at||'').slice(11,16);
+      text=`daemon: 上次 ${s.last_batch_count||0} 条 @ ${t} — pending ${s.pending||0}`;
+      bg='#1a1f2e';
+    } else {
+      text=`daemon: 待命 — pending ${s.pending||0}`;
+      bg='#1a1f2e';
     }
+    pill.textContent=text;
+    pill.style.background=bg;
+    pill.dataset.pending=s.pending||0;
+    if(!_daemonStatusInterval){
+      _daemonStatusInterval=setInterval(checkDaemonStatus,10000);
+    }
+  }catch(e){
+    _daemonFailCount++;
+    console.warn('checkDaemonStatus error:',e);
   }
 }

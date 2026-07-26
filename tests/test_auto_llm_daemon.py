@@ -249,3 +249,18 @@ class TestSSEPushSafety:
         # _run_llm_batch should still complete despite SSE failures
         d._run_llm_batch()
         assert mock_engine.process_batch.called
+
+
+class TestGetStatus:
+    def test_daemon_status_returns_5_fields(self, mock_storage, mock_engine):
+        d = AutoLlmDaemon(storage=mock_storage, signal_engine=mock_engine)
+        status = d.get_status()
+        assert isinstance(status, dict)
+        assert set(status.keys()) == {
+            "running", "pending", "last_batch_at",
+            "last_batch_count", "last_digest_at"
+        }
+        # Before any batch runs, batch fields are None
+        assert status["last_batch_at"] is None
+        assert status["last_batch_count"] is None
+        assert status["last_digest_at"] is None

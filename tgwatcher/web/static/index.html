@@ -597,8 +597,7 @@ body{font-family:var(--font-ui);font-size:var(--fs-md);background:var(--bg-0);co
       <div class="view" id="viewSignal">
         <div style="padding:12px 16px 0;display:flex;align-items:center;gap:10px">
           <h2 style="font-size:var(--fs-lg);font-weight:600">信号分析</h2>
-          <button class="btn btn-cyan" id="btnSignalProcess" onclick="startSignalProcess()" style="font-size:var(--fs-xs);padding:2px 8px;margin-left:8px">处理全部</button>
-          <button class="btn" id="btnSignalStop" onclick="stopSignalProcess()" style="font-size:var(--fs-xs);padding:2px 8px;display:none">停止</button>
+          <span id="signalDaemonPill" style="padding:2px 8px;border:1px solid var(--border);border-radius:4px;font-size:var(--fs-xs);background:var(--bg-1);color:var(--text-2)">加载中...</span>
           <button class="btn" onclick="openSignalExportModal()" style="font-size:var(--fs-xs);padding:2px 8px;margin-left:auto">导出</button>
           <span id="signalProgress" style="font-size:var(--fs-xs);color:var(--text-2);margin-left:8px"></span>
         </div>

@@ -5,7 +5,7 @@
 //   - loadCrawlStatus, loadMessages, currentChat, currentPage (app.js)
 //   - loadAutoPollState, loadListenState, loadWebhookState (app.js)
 //   - updateCrawlUI, refreshAutoPollUI, refreshListenerBadge,
-//     refreshWebhookBadge, showToast, checkSignalStatus (render.js / app.js)
+//     refreshWebhookBadge, showToast (render.js / app.js)
 
 let sseConnected=false,fallBackInterval=null;
 let _sseAbort=null,_sseRetryIdx=0,_lastSSEId=0;
@@ -51,7 +51,6 @@ function connectSSE(){
         crawl_status:e=>updateCrawlUI(JSON.parse(e.data)),
         new_messages:e=>{if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage)},
         crawl_error:e=>{showToast(e.data,'error')},
-        signal_process_status:e=>{checkSignalStatus()},
         auto_poll_tick:e=>{try{JSON.parse(e.data);refreshAutoPollUI()}catch(_){}},
         listener_status:e=>{try{refreshListenerBadge(JSON.parse(e.data))}catch(_){}},
         new_signal:e=>{try{flashNewSignal(JSON.parse(e.data))}catch(_){}},
