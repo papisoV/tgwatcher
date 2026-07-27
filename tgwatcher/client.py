@@ -44,10 +44,11 @@ class TGClient:
         return str(self.session_dir / f"tgwatcher_{safe_phone}")
 
     async def connect(self) -> None:
+        from tgwatcher.tg_session import WALSQLiteSession
         self.client = TelegramClient(
-            self._session_path(),
-            self.api_id,
-            self.api_hash,
+            session=WALSQLiteSession(self._session_path()),
+            api_id=self.api_id,
+            api_hash=self.api_hash,
             proxy=self.proxy,
             loop=self._loop,
         )
