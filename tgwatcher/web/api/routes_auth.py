@@ -75,15 +75,17 @@ def login_status():
 def _session_file_exists(config: dict, phone: str) -> bool:
     """Return True if the Telethon session file for `phone` exists.
 
-    Mirrors TGClient._session_path() logic. A present session file means
-    Telethon successfully called start() in a prior process — sufficient
-    signal for the UI to skip the login overlay.
+    Mirrors TGClient._session_path() logic. Telethon appends `.session`
+    to the path passed to TelegramClient(session=...), so we check for
+    `<session_dir>/tgwatcher_<phone>.session`. A present session file
+    means Telethon successfully called start() in a prior process —
+    sufficient signal for the UI to skip the login overlay.
     """
     from pathlib import Path
     tg = config.get("telegram", {})
     session_dir = Path(tg.get("session_dir", "./sessions"))
     safe_phone = phone.replace("+", "")
-    return (session_dir / f"tgwatcher_{safe_phone}").exists()
+    return (session_dir / f"tgwatcher_{safe_phone}.session").exists()
 
 
 @bp.route("/login", methods=["POST"])
