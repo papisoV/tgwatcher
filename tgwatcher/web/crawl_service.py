@@ -138,7 +138,7 @@ class CrawlService:
             logger.error("Crawl timed out after 1 hour", extra={"mode": mode, "action": "crawl_timeout"})
             self._update_status(error="爬取超时 (1小时)")
         except Exception as e:
-            logger.error("Crawl service error", extra={"mode": mode, "error": str(e), "action": "crawl_error"})
+            logger.error("Crawl service error", extra={"mode": mode, "error": str(e), "action": "crawl_error"}, exc_info=True)
             self._update_status(error=str(e))
         finally:
             self._stop_event.set()
@@ -172,12 +172,25 @@ class CrawlService:
 
         storage = self._storage
 
-        # Use shared TGClient if available, otherwise create our own
+        # Use shared TGClient if available, otherwise create our own.
+        # Hold _tg_lock for the entire crawl — not just connect — because
+        # Telethon's session file writes (pts/qts/update_state/auth_key)
+        # happen on every iter_messages call, and concurrent _tg_client_guard
+        # callers (login_status, dialogs) writing the same session file cause
+        # "database is locked" errors. PRAGMA busy_timeout cannot resolve
+        # same-connection cursor races, so the lock must serialize all access.
+        _lock_acquired = False
         if self._get_tg_client:
-            with self._tg_lock:
+            self._tg_lock.acquire()
+            _lock_acquired = True
+            try:
                 tg = self._get_tg_client()
                 if tg.client is None or not tg.client.is_connected():
                     await tg.connect()
+            except Exception:
+                self._tg_lock.release()
+                _lock_acquired = False
+                raise
             self._owns_client = False
         else:
             loop = self._async_loop.get_loop() if self._async_loop else None
@@ -299,6 +312,12 @@ class CrawlService:
             if self._owns_client:
                 await tg.disconnect()
                 self._owns_client = False
+            # Release _tg_lock only if we acquired it for shared-client crawl.
+            if _lock_acquired:
+                try:
+                    self._tg_lock.release()
+                except RuntimeError:
+                    pass
 
     async def _fetch_with_stop_check(self, tg, **kwargs) -> list:
         """Fetch messages but check stop_event between individual message fetches.
