@@ -126,9 +126,12 @@ class TestRunLlmBatch:
 
     def test_skip_when_pending_below_min_signals(self, mock_storage, mock_engine, sse_events):
         events, push = sse_events
-        # Override pending count to 3 (below min_signals=5)
+        # Override pending count to 3 (below min_signals=5).
+        # count_pending() runs two queries: source1 (pending signal_factors)
+        # and source2 (unprocessed messages). fetchone.side_effect returns
+        # 3 for source1, 0 for source2 → total 3 < min_signals=5.
         r = MagicMock()
-        r.fetchone.return_value = (3,)
+        r.fetchone.side_effect = [(3,), (0,)]
         mock_storage.get_session.return_value.__enter__.return_value.execute.return_value = r
         d = AutoLlmDaemon(mock_storage, mock_engine, push, min_signals=5)
         d._run_llm_batch()

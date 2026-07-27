@@ -31,7 +31,10 @@ signal:
   llm:
     # Active provider — must match a key in `providers` below.
     # Supported: deepseek | openai | anthropic | openrouter | moonshot | zhipu | ollama | astron
-    provider: deepseek
+    provider: openai
+    # Fallback order: if the active provider fails, try these in order.
+    # Providers not in this list are skipped on fallback. Empty list = no fallback.
+    fallback_order: [openai, anthropic, astron]
     # All provider credentials. Only the active one (selected by `provider`)
     # is used at runtime; others are ignored but kept here for easy switching.
     providers:
@@ -43,17 +46,19 @@ signal:
         max_tokens: 512
       openai:
         api_key: ''
-        base_url: https://api.openai.com/v1
+        base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
         model: gpt-4o-mini
         temperature: 0
         max_tokens: 512
+        max_tokens_batch: 4096  # 批处理专用 token 预算；0 或缺省 = max_tokens*2
       anthropic:
         # Official: https://api.anthropic.com
         # Proxy example: https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic
         api_key: ''
-        base_url: https://api.anthropic.com
+        base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic
         model: claude-sonnet-4-6
         max_tokens: 1024
+        max_tokens_batch: 4096
       openrouter:
         api_key: ''
         base_url: https://openrouter.ai/api/v1
@@ -68,7 +73,7 @@ signal:
         model: astron-code-latest
         temperature: 0
         max_tokens: 512
-        max_tokens_batch: 1024  # 批处理专用 token 预算；0 或缺省 = max_tokens*2
+        max_tokens_batch: 4096  # 批处理专用 token 预算；0 或缺省 = max_tokens*2
     timeout_connect: 30
     timeout_read: 60
     timeout_write: 30
@@ -92,7 +97,7 @@ signal:
   filter:
     min_text_length: 10
     pass_if_any_match: true
-  batch_size: 50
+  batch_size: 10
   llm_batch_size: 15
   llm_delay: 1.0
   factor_version: 2

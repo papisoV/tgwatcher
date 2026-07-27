@@ -38,7 +38,7 @@ KNOWN_SECTION_KEYS: dict[str, tuple[str, ...]] = {
                "auto_llm", "auto_digest_interval_minutes", "auto_llm_min_signals"),
     "signal_llm": ("provider", "providers", "timeout_connect", "timeout_read",
                    "timeout_write", "timeout_pool", "max_retries",
-                   "max_batch_size", "checkpoint_dir"),
+                   "max_batch_size", "checkpoint_dir", "fallback_order"),
     "crawl": ("interval_minutes", "limit", "max_delay", "min_delay", "mode"),
     "proxy": ("enabled", "host", "port", "protocol"),
     "timezone": ("utc_offset_hours",),
@@ -232,6 +232,38 @@ def validate_config(config: dict) -> list[str]:
                             "'signal.llm.checkpoint_dir' must be a string "
                             "(path, optional)."
                         )
+                    # fallback_order — optional list of provider name strings.
+                    # Each entry must be a key in providers.
+                    fbo = sig_llm.get("fallback_order")
+                    if fbo is not None:
+                        if not isinstance(fbo, list) or not all(
+                            isinstance(x, str) for x in fbo
+                        ):
+                            errors.append(
+                                "'signal.llm.fallback_order' must be a list "
+                                "of provider name strings."
+                            )
+                        elif not fbo:
+                            errors.append(
+                                "'signal.llm.fallback_order' must not be "
+                                "empty — omit the key to use only the "
+                                "primary provider."
+                            )
+                        else:
+                            # Validate entries against providers dict (when
+                            # providers is present and non-empty).
+                            if isinstance(providers, dict) and providers:
+                                unknown = [
+                                    p for p in fbo if p not in providers
+                                ]
+                                if unknown:
+                                    errors.append(
+                                        "'signal.llm.fallback_order' "
+                                        f"references unknown provider(s): "
+                                        f"{unknown}. Add their credentials "
+                                        f"under 'providers:' or remove "
+                                        f"from fallback_order."
+                                    )
                     if providers is not None:
                         if not _is_dict(providers):
                             errors.append(

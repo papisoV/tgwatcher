@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -168,6 +169,10 @@ class LLMConfig:
     # Full providers dict (kept for future runtime-switching; current code
     # only uses the active provider resolved at construction time).
     providers: dict[str, dict] = field(default_factory=dict)
+    # Ordered list of provider names to try on transient errors. Defaults to
+    # [provider] (primary only) when not specified — preserves legacy behavior.
+    # Each entry must be a key in `providers` (validated in from_dict).
+    fallback_order: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, llm_cfg: dict) -> "LLMConfig":
@@ -238,6 +243,39 @@ class LLMConfig:
                 f"or signal.llm.providers.{provider}.api_key"
             )
 
+        # fallback_order: optional list of provider names to try on transient
+        # errors. Defaults to [provider] (primary only) when absent.
+        raw_fallback = llm_cfg.get("fallback_order")
+        if raw_fallback is None:
+            fallback_order = [provider]
+        else:
+            if not isinstance(raw_fallback, list) or not all(
+                isinstance(x, str) for x in raw_fallback
+            ):
+                raise ValueError(
+                    "signal.llm.fallback_order must be a list of provider name "
+                    "strings."
+                )
+            if not raw_fallback:
+                raise ValueError(
+                    "signal.llm.fallback_order must not be empty — omit the "
+                    "key to use only the primary provider."
+                )
+            unknown = [p for p in raw_fallback if p not in PROVIDER_PROTOCOLS]
+            if unknown:
+                raise ValueError(
+                    f"Unknown provider(s) in signal.llm.fallback_order: "
+                    f"{unknown}. Supported: {sorted(PROVIDER_PROTOCOLS)}"
+                )
+            missing = [p for p in raw_fallback if p not in providers]
+            if missing:
+                raise ValueError(
+                    f"signal.llm.fallback_order references provider(s) not in "
+                    f"signal.llm.providers: {missing}. Add their credentials "
+                    f"under providers: key."
+                )
+            fallback_order = list(raw_fallback)
+
         return cls(
             provider=provider,
             base_url=base_url,
@@ -252,6 +290,7 @@ class LLMConfig:
             timeout_pool=float(llm_cfg.get("timeout_pool", 10.0)),
             max_retries=int(llm_cfg.get("max_retries", 3)),
             providers=providers,
+            fallback_order=fallback_order,
         )
 
 
@@ -282,7 +321,7 @@ class SignalLLMClient:
                 f"{sorted(PROVIDER_PROTOCOLS)}"
             )
 
-        # Build httpx timeout (shared by both SDKs).
+        # Build httpx timeout (shared by both SDKs and all providers in pool).
         timeout = httpx.Timeout(
             connect=config.timeout_connect,
             read=config.timeout_read,
@@ -290,28 +329,74 @@ class SignalLLMClient:
             pool=config.timeout_pool,
         )
 
-        if self._protocol == "openai":
-            self._client = OpenAI(
-                base_url=config.base_url,
-                api_key=config.api_key,
-                timeout=timeout,
-                max_retries=config.max_retries,
-            )
-        elif self._protocol == "anthropic":
+        # Pre-build a client pool for every provider in fallback_order. This
+        # lets `_call_with_fallback` switch instantly on transient errors
+        # instead of paying construction cost mid-request. Dead providers
+        # (e.g. anthropic SDK missing) are skipped — they'll be filtered out
+        # of the fallback chain rather than crashing the whole client.
+        self._clients: dict[str, Any] = {}
+        for provider_name in config.fallback_order:
+            # Primary provider's credentials live at top-level config fields;
+            # secondary providers come from the providers dict.
+            if provider_name == config.provider:
+                p_base_url = config.base_url
+                p_api_key = config.api_key
+            else:
+                pcfg = config.providers.get(provider_name, {})
+                p_base_url = pcfg.get("base_url", "")
+                p_api_key = pcfg.get("api_key", "")
+
+            protocol = PROVIDER_PROTOCOLS.get(provider_name, "openai")
             try:
-                from anthropic import Anthropic
-            except ImportError as e:
-                raise ValueError(
-                    "anthropic package not installed. Run: pip install anthropic>=0.40.0"
-                ) from e
-            self._client = Anthropic(
-                base_url=config.base_url,
-                api_key=config.api_key,
-                timeout=timeout,
-                max_retries=config.max_retries,
+                if protocol == "openai":
+                    self._clients[provider_name] = OpenAI(
+                        base_url=p_base_url,
+                        api_key=p_api_key,
+                        timeout=timeout,
+                        max_retries=0,  # fallback chain handles retries
+                    )
+                elif protocol == "anthropic":
+                    try:
+                        from anthropic import Anthropic
+                    except ImportError:
+                        logger.warning(
+                            "Provider %s skipped: anthropic package not "
+                            "installed. Install with: pip install "
+                            "anthropic>=0.40.0",
+                            provider_name,
+                        )
+                        continue
+                    self._clients[provider_name] = Anthropic(
+                        base_url=p_base_url,
+                        api_key=p_api_key,
+                        timeout=timeout,
+                        max_retries=0,
+                    )
+                else:
+                    logger.warning(
+                        "Provider %s skipped: unknown protocol %r",
+                        provider_name, protocol,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Provider %s skipped due to construction failure: %s",
+                    provider_name, e,
+                )
+
+        if not self._clients:
+            raise ValueError(
+                "No LLM clients could be constructed — every provider in "
+                f"fallback_order failed: {config.fallback_order}"
             )
-        else:  # Defensive — should be unreachable.
-            raise ValueError(f"Unhandled protocol: {self._protocol}")
+
+        # Keep self._client as a read-only alias for the primary client, so
+        # legacy code paths that read it directly keep working.
+        self._client = self._clients.get(config.provider)
+        # Defensive: primary provider must be in fallback_order to be in pool.
+        if self._client is None:
+            # Primary missing from fallback_order — promote the first available
+            # so callers don't crash. LLMConfig.from_dict should prevent this.
+            self._client = next(iter(self._clients.values()))
 
         self._provider = config.provider
         self._model = config.model
@@ -321,6 +406,11 @@ class SignalLLMClient:
         # operators can verify the active value from config.
         self._max_tokens_batch = config.max_tokens_batch or (config.max_tokens * 2)
         self._max_retries = config.max_retries
+        # Delay between fallback providers. Xunfei maas-coding-api proxy
+        # returns 503 "system busy" under concurrent load; immediate fallback
+        # hits the same overloaded backend. A 2s pause gives it room to recover.
+        self._fallback_delay_seconds = 2.0
+        self._config = config
 
         logger.info(
             "SignalLLMClient initialized",
@@ -331,6 +421,8 @@ class SignalLLMClient:
                 "model": config.model,
                 "max_tokens": self._max_tokens,
                 "max_tokens_batch": self._max_tokens_batch,
+                "fallback_order": config.fallback_order,
+                "pool_size": len(self._clients),
             },
         )
 
@@ -343,6 +435,28 @@ class SignalLLMClient:
     def model_name(self) -> str:
         """Active model name (e.g. 'astron-code-latest', 'claude-sonnet-4-6')."""
         return self._model
+
+    @staticmethod
+    def _is_transient_error(e: Exception) -> bool:
+        """Classify an exception as transient (retryable) or permanent.
+
+        Duck-typing on `status_code` attribute avoids import coupling to
+        openai/anthropic SDK exception hierarchies. Treats 429/500/502/503/504,
+        TimeoutError, ConnectionError, and openai SDK's APITimeoutError /
+        APIConnectionError class names as transient. Everything else is
+        considered permanent (e.g. 400 BadRequest, 401 Unauthorized,
+        ValidationError).
+        """
+        status = getattr(e, "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+        if isinstance(e, (TimeoutError, ConnectionError)):
+            return True
+        # openai SDK exception class names — avoid hard import dependency.
+        cls_name = type(e).__name__
+        if cls_name in ("APITimeoutError", "APIConnectionError"):
+            return True
+        return False
 
     def _format_preliminary_text(self, preliminary_factors: dict[str, Any]) -> str:
         """
@@ -450,9 +564,9 @@ class SignalLLMClient:
                  json_mode: bool = True) -> str:
         """Dispatch prompt to the configured provider, return raw text response.
 
-        Routes to `_call_openai` or `_call_anthropic` based on provider protocol.
-        Both paths return the raw model output text; JSON parsing + validation
-        is handled by the caller.
+        Delegates to `_call_with_fallback` so transient errors (503/429/
+        timeout) automatically retry the next provider in fallback_order.
+        Call sites — including `digest.py:327` — keep working unchanged.
 
         Args:
             prompt: The user prompt to send.
@@ -463,14 +577,113 @@ class SignalLLMClient:
                 refine/refine_batch for factor extraction). If False, allow
                 free-form text (used by daily_digest for prose summaries).
         """
-        if self._protocol == "openai":
-            return self._call_openai(prompt, max_tokens_override=max_tokens_override,
-                                     json_mode=json_mode)
-        elif self._protocol == "anthropic":
-            return self._call_anthropic(prompt, max_tokens_override=max_tokens_override,
-                                        json_mode=json_mode)
-        # Defensive — protocol validated in __init__.
-        raise ValueError(f"Unhandled protocol: {self._protocol}")
+        return self._call_with_fallback(
+            prompt,
+            max_tokens_override=max_tokens_override,
+            json_mode=json_mode,
+        )
+
+    def _call_llm_with_provider(
+        self,
+        provider_name: str,
+        client: Any,
+        prompt: str,
+        max_tokens_override: int | None = None,
+        json_mode: bool = True,
+    ) -> str:
+        """Call a specific provider's client. Used by `_call_with_fallback`.
+
+        Routes to `_call_openai` or `_call_anthropic` based on the provider's
+        protocol. Temporarily swaps `self._client` and provider-specific model
+        so the existing protocol methods work unchanged.
+        """
+        protocol = PROVIDER_PROTOCOLS.get(provider_name, "openai")
+        # Resolve per-provider model: primary uses self._model, others use
+        # providers[name].model from config.
+        if provider_name == self._provider:
+            model = self._model
+        else:
+            pcfg = self._config.providers.get(provider_name, {})
+            model = pcfg.get("model", self._model)
+
+        # Temporarily swap state so _call_openai/_call_anthropic use the
+        # fallback provider's client + model. Restore in finally to keep
+        # object state consistent for callers reading self._client/_model.
+        prev_client = self._client
+        prev_provider = self._provider
+        prev_model = self._model
+        prev_protocol = self._protocol
+        self._client = client
+        self._provider = provider_name
+        self._model = model
+        self._protocol = protocol
+        try:
+            if protocol == "openai":
+                return self._call_openai(
+                    prompt,
+                    max_tokens_override=max_tokens_override,
+                    json_mode=json_mode,
+                )
+            elif protocol == "anthropic":
+                return self._call_anthropic(
+                    prompt,
+                    max_tokens_override=max_tokens_override,
+                    json_mode=json_mode,
+                )
+            raise ValueError(f"Unhandled protocol: {protocol}")
+        finally:
+            self._client = prev_client
+            self._provider = prev_provider
+            self._model = prev_model
+            self._protocol = prev_protocol
+
+    def _call_with_fallback(
+        self,
+        prompt: str,
+        max_tokens_override: int | None = None,
+        json_mode: bool = True,
+    ) -> str:
+        """Try each provider in fallback_order. Skip dead providers.
+
+        - Transient errors (503/429/timeout) → log warning and try next.
+        - Permanent errors (400/401/ValidationError) → re-raise immediately.
+        - All providers exhausted → raise the last error.
+        - Providers missing from the pool (failed construction) → skipped.
+        """
+        last_error: Exception | None = None
+        for provider_name in self._config.fallback_order:
+            client = self._clients.get(provider_name)
+            if client is None:
+                # Dead provider (construction failed at __init__) — skip.
+                continue
+            try:
+                return self._call_llm_with_provider(
+                    provider_name,
+                    client,
+                    prompt,
+                    max_tokens_override=max_tokens_override,
+                    json_mode=json_mode,
+                )
+            except Exception as e:
+                last_error = e
+                if self._is_transient_error(e):
+                    logger.warning(
+                        "Provider %s transient error, falling back: %s",
+                        provider_name, str(e)[:200],
+                    )
+                    # Brief pause before next provider — gives the upstream
+                    # proxy a moment to recover. Without this, immediate
+                    # fallback hits the same overloaded backend 3x in a row.
+                    time.sleep(self._fallback_delay_seconds)
+                    continue
+                # Permanent error — don't try other providers.
+                raise
+        if last_error is not None:
+            raise last_error
+        # No providers in pool at all (should be caught by __init__).
+        raise RuntimeError(
+            "No LLM providers available — client pool is empty."
+        )
 
     def _call_openai(self, prompt: str, max_tokens_override: int | None = None,
                      json_mode: bool = True) -> str:
