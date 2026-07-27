@@ -228,19 +228,41 @@ class AutoLlmDaemon:
 
     # --- helpers ---
     def count_pending(self) -> int:
-        """Count signal_factors rows with llm_status='pending'.
+        """Count messages that need LLM processing.
 
-        Uses storage facade's session to query directly. Returns 0 on error
-        (daemon will skip — safer than crashing the loop).
+        Two sources:
+          1. signal_factors rows with llm_status='pending' AND filter_result='passed'
+             (already filtered, waiting for LLM)
+          2. messages with no signal_factors row at all (newly crawled, not
+             filtered yet) — these will be filtered + processed by
+             SignalEngine.process_batch's get_unprocessed_messages path.
+
+        Without source #2, the daemon skips crawl batches that brought new
+        messages because count_pending returns 0 — the new messages sit in
+        the messages table unprocessed forever.
         """
         from sqlalchemy import text
         try:
             with self._storage.get_session() as sess:
-                r = sess.execute(text(
+                # Source 1: pending signal_factors
+                r1 = sess.execute(text(
                     "SELECT COUNT(*) FROM signal_factors "
                     "WHERE llm_status='pending' AND filter_result='passed'"
                 ))
-                return int(r.fetchone()[0])
+                pending_sf = int(r1.fetchone()[0])
+                # Source 2: messages without any signal_factors row
+                # (LEFT JOIN ... WHERE sf.id IS NULL). Skips deleted/empty-text
+                # rows to match get_unprocessed_messages semantics.
+                r2 = sess.execute(text(
+                    "SELECT COUNT(*) FROM messages m "
+                    "LEFT JOIN signal_factors sf "
+                    "  ON m.message_id=sf.message_id AND m.chat_id=sf.chat_id "
+                    "WHERE sf.id IS NULL "
+                    "  AND m.is_deleted=0 AND m.text IS NOT NULL "
+                    "  AND LENGTH(m.text) >= 10"
+                ))
+                unprocessed_msgs = int(r2.fetchone()[0])
+                return pending_sf + unprocessed_msgs
         except Exception as e:
             logger.warning("Auto-LLM: count_pending failed: %s", e)
             return 0

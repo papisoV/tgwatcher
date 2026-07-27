@@ -30,6 +30,8 @@ COLD_START_HOURS = 36        # first-ever digest: 36h (no need for full 7d)
 WINDOW_HOURS = 168           # 7 days — half-life weighting handles aging beyond 36h
 MAX_WINDOW_HOURS = 168      # cap for incremental digest (last_digest.to_at → now)
 MIN_SIGNALS_FOR_SUMMARY = 5    # below this, skip LLM and return "no change"
+MAX_LOOKBACK_HOURS = 720      # 30 days — hard cap for user-requested lookback
+AUTO_LOOKBACK_HOURS = 168     # auto-fallback window when incremental has <5 signals
 DEFAULT_HALFLIFE_MIN = 60    # fallback when signal's halflife_min is None/0
 
 DIGEST_PROMPT_TEMPLATE = """你是一个加密货币市场分析师。基于以下结构化信号数据，写一份简洁的中文市场摘要。
@@ -88,9 +90,18 @@ class DigestResult:
         }
 
 
-def _compute_window(storage: Storage) -> tuple[datetime, datetime]:
-    """Determine [from_at, to_at] for next digest. Both UTC, naive."""
+def _compute_window(storage: Storage, lookback_hours: int | None = None) -> tuple[datetime, datetime]:
+    """Determine [from_at, to_at] for next digest. Both UTC, naive.
+
+    Args:
+        lookback_hours: If set (user-requested), force window to
+            (now - lookback_hours, now). Overrides incremental logic.
+            Capped to MAX_LOOKBACK_HOURS (720h = 30d).
+    """
     now = utc_now().replace(tzinfo=None)
+    if lookback_hours is not None:
+        hours = max(1, min(int(lookback_hours), MAX_LOOKBACK_HOURS))
+        return now - timedelta(hours=hours), now
     with storage.get_session() as sess:
         latest = sess.execute(
             select(Digest).order_by(Digest.to_at.desc()).limit(1)
@@ -265,15 +276,35 @@ def _build_prompt(agg: dict) -> str | None:
     return DIGEST_PROMPT_TEMPLATE.format(**agg)
 
 
-def generate_digest(storage: Storage, llm: SignalLLMClient) -> DigestResult:
+def generate_digest(storage: Storage, llm: SignalLLMClient,
+                    lookback_hours: int | None = None) -> DigestResult:
     """Compute window, fetch signals, call LLM, persist. Returns DigestResult.
 
-    If signal_count < MIN_SIGNALS_FOR_SUMMARY, skips LLM and returns a
-    "no significant change" stub (still persisted to history for audit).
+    Args:
+        lookback_hours: If set, force window to (now - lookback_hours, now)
+            instead of using incremental last-digest logic. Capped to
+            MAX_LOOKBACK_HOURS (720h). None = incremental (default).
+            When the incremental window yields <MIN_SIGNALS_FOR_SUMMARY
+            signals, auto-falls back to AUTO_LOOKBACK_HOURS (168h = 7d)
+            before giving up and writing the "no change" stub.
     """
-    from_at, to_at = _compute_window(storage)
+    from_at, to_at = _compute_window(storage, lookback_hours=lookback_hours)
     signals = _fetch_signals(storage, from_at, to_at)
     count = len(signals)
+
+    # Auto-fallback: incremental window had <5 signals, expand to 7d lookback
+    # (only when user didn't explicitly request a window — preserves user intent).
+    if count < MIN_SIGNALS_FOR_SUMMARY and lookback_hours is None:
+        fallback_from, fallback_to = _compute_window(storage, lookback_hours=AUTO_LOOKBACK_HOURS)
+        fallback_signals = _fetch_signals(storage, fallback_from, fallback_to)
+        if len(fallback_signals) >= MIN_SIGNALS_FOR_SUMMARY:
+            from_at, to_at, signals, count = (
+                fallback_from, fallback_to, fallback_signals, len(fallback_signals),
+            )
+            logger.info(
+                "Digest auto-fallback: incremental had %d signals, expanded to 7d window (%d signals)",
+                count, len(fallback_signals),
+            )
 
     if count < MIN_SIGNALS_FOR_SUMMARY:
         logger.info("Digest skipped: only %d signals in window (min=%d)",

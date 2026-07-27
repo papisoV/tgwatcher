@@ -27,6 +27,11 @@ def generate_digest():
 
     Concurrency: module-level Lock — only one generation at a time. If a
     request is already running, returns 409.
+
+    Query/body params:
+        lookback_hours: int (optional). If set, force window to
+            (now - lookback_hours, now) instead of incremental. Capped to
+            720 (30d). Default: incremental with 7d auto-fallback.
     """
     _storage = _app_state.storage
     if not _storage:
@@ -35,13 +40,22 @@ def generate_digest():
     if not _signal_engine or not getattr(_signal_engine, "_llm", None):
         return jsonify({"error": "Signal engine / LLM not initialized"}), 500
 
+    # Accept lookback_hours from JSON body or query string.
+    lookback_hours = None
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        lookback_hours = body.get("lookback_hours")
+    if lookback_hours is None:
+        lookback_hours = request.args.get("lookback_hours", type=int)
+
     if not _digest_lock.acquire(blocking=False):
         return jsonify({"error": "Another digest generation is in progress"}), 409
 
     try:
         from tgwatcher.digest import generate_digest as _gen
         try:
-            result = _gen(_storage, _signal_engine._llm)
+            result = _gen(_storage, _signal_engine._llm,
+                          lookback_hours=lookback_hours)
         except Exception as e:
             logger.exception("Digest generation failed")
             return jsonify({"error": f"Generation failed: {e}"}), 500

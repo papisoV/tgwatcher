@@ -55,13 +55,33 @@ function showDigestInLatest(el){
 async function generateDigest(){
   const btn=document.getElementById('btnDigestGenerate');
   const status=document.getElementById('digestStatus');
-  btn.disabled=true;btn.textContent='生成中...';status.textContent='调用 LLM 中（约 5-15 秒）';
+  const lookbackSelect=document.getElementById('digestLookback');
+  const lookbackHours=lookbackSelect?parseInt(lookbackSelect.value):0;
+  btn.disabled=true;btn.textContent='生成中...';
+  status.textContent=lookbackHours>0?`调用 LLM 中（${lookbackHours}h 窗口，约 10-30 秒）`:'调用 LLM 中（增量窗口，约 5-30 秒）';
   try{
-    const r=await api('/api/digest/generate','POST');
-    if(!r){status.textContent='生成失败';return;}
+    // Digest generation calls LLM (max_tokens=1024, free-form prose) — easily
+    // exceeds the 15s timeout in api(). Use a dedicated 90s fetch window.
+    const ctrl=new AbortController();
+    const timer=setTimeout(()=>ctrl.abort(),90000);
+    const body=lookbackHours>0?JSON.stringify({lookback_hours:lookbackHours}):'{}';
+    const r=await fetch(API+'/api/digest/generate',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body,
+      signal:ctrl.signal,
+    }).finally(()=>clearTimeout(timer));
+    if(r.status===401){authToken='';localStorage.removeItem('tgwatcher_token');location.reload();return;}
+    if(!r.ok){
+      const errBody=await r.json().catch(()=>({}));
+      status.textContent='生成失败: '+(errBody.error||('HTTP '+r.status));
+      return;
+    }
+    const result=await r.json();
+    if(!result||!result.summary){status.textContent='生成失败: 空响应';return;}
     const latestEl=document.getElementById('digestLatest');
-    latestEl.textContent=r.summary;latestEl.style.color='var(--text-0)';
-    status.textContent=`生成完毕 · ${r.signal_count}条信号 · ${r.from_at?r.from_at.slice(5,16).replace('T',' '):''} → ${r.to_at?r.to_at.slice(5,16).replace('T',' '):''}`;
+    latestEl.textContent=result.summary;latestEl.style.color='var(--text-0)';
+    status.textContent=`生成完毕 · ${result.signal_count}条信号 · ${result.from_at?result.from_at.slice(5,16).replace('T',' '):''} → ${result.to_at?result.to_at.slice(5,16).replace('T',' '):''}`;
     loadDigestTab();
   }catch(e){
     status.textContent='生成失败: '+(e?.message||e);
