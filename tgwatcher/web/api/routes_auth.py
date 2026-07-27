@@ -63,14 +63,27 @@ def login_status():
 
     phone = _app_state.config["telegram"]["phone"]
 
-    try:
-        with _tg_client_guard() as tg:
-            connected = _run_coro(tg.client.is_user_authorized())
-    except Exception as e:
-        logger.warning("Login status check failed: %s", e, exc_info=True)
-        connected = False
+    # Session-file fast path: if the Telethon session file exists, treat
+    # the user as logged in without touching Telethon. This avoids blocking
+    # on _tg_lock during catchup crawl (the root cause of login_status
+    # TimeoutError that kicked users back to the login overlay).
+    session_logged_in = _session_file_exists(_app_state.config, phone)
 
-    return jsonify({"logged_in": connected, "phone": phone})
+    return jsonify({"logged_in": session_logged_in, "phone": phone})
+
+
+def _session_file_exists(config: dict, phone: str) -> bool:
+    """Return True if the Telethon session file for `phone` exists.
+
+    Mirrors TGClient._session_path() logic. A present session file means
+    Telethon successfully called start() in a prior process — sufficient
+    signal for the UI to skip the login overlay.
+    """
+    from pathlib import Path
+    tg = config.get("telegram", {})
+    session_dir = Path(tg.get("session_dir", "./sessions"))
+    safe_phone = phone.replace("+", "")
+    return (session_dir / f"tgwatcher_{safe_phone}").exists()
 
 
 @bp.route("/login", methods=["POST"])

@@ -31,7 +31,15 @@ async function checkLogin(){
   if(_loginCheckPending)return;_loginCheckPending=true;
   try{
     const r=await api('/api/login/status');
-    if(!r){document.getElementById('loginOverlay').style.display='flex';return}
+    if(!r){
+      // Network error / timeout (e.g. catchup crawl holding Telethon lock).
+      // Do NOT kick back to login overlay — the previous checkLogin already
+      // established the session. checkConnection() will recover on next poll.
+      if(!document.getElementById('app').style.display || document.getElementById('app').style.display==='none'){
+        document.getElementById('loginOverlay').style.display='flex';
+      }
+      return;
+    }
     if(r.error==='Unauthorized'){authToken='';localStorage.removeItem('tgwatcher_token');showLoginStep(0);document.getElementById('loginError0').textContent='Token 无效';document.getElementById('loginOverlay').style.display='flex';return}
     if(r.logged_in){document.getElementById('loginOverlay').style.display='none';document.getElementById('app').style.display='flex';initApp();return}
     showLoginStep(1);document.getElementById('loginOverlay').style.display='flex';
