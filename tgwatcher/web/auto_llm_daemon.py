@@ -64,6 +64,7 @@ class AutoLlmDaemon:
         self._trigger_event = threading.Event()
         self._shutdown = threading.Event()
         self._running = threading.Event()  # set while run_loop is alive
+        self._batch_running = threading.Event()  # set only during _run_llm_batch
         self._thread: threading.Thread | None = None
         self._last_digest_at: datetime | None = None
         self._last_batch_at: datetime | None = None
@@ -142,9 +143,13 @@ class AutoLlmDaemon:
         t0 = time.time()
         logger.info("Auto-LLM: starting batch (%d pending)", pending_count)
 
-        result = self._engine.process_batch(
-            stop_check=self._shutdown.is_set,
-        )
+        self._batch_running.set()
+        try:
+            result = self._engine.process_batch(
+                stop_check=self._shutdown.is_set,
+            )
+        finally:
+            self._batch_running.clear()
         duration_ms = int((time.time() - t0) * 1000)
 
         with self._status_lock:
@@ -304,6 +309,7 @@ class AutoLlmDaemon:
 
         return {
             "running": running,
+            "batch_running": self._batch_running.is_set(),
             "pending": pending,
             "last_batch_at": _iso_z(last_batch_at),
             "last_batch_count": last_batch_count,

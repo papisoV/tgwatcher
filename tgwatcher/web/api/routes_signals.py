@@ -45,10 +45,29 @@ def signal_process():
     Returns 409 with {"error": "Signal processing already running"} if the
     SignalService reports it is already running, OR 409 with
     {"error": "already running", "lock": "signal"} if another caller holds
-    the per-route _signal_lock (e.g. concurrent HTTP request).
+    the per-route _signal_lock (e.g. concurrent HTTP request), OR 409 with
+    {"error": "AutoLlmDaemon is running"} if the daemon is mid-batch.
+
+    Body params (all optional):
+        chat_id: int — restrict to a single chat
+        overwrite: bool — re-process already-analyzed messages
+        date_from: ISO str — local datetime lower bound (inclusive)
+        date_to:   ISO str — local datetime upper bound (inclusive, end-of-day
+                   if no time component)
     """
     if not _app_state.signal_service:
         return jsonify({"error": "Signal processing not enabled"}), 400
+    # Daemon互斥: daemon 正在跑 batch 时拒绝手动触发,避免并发 LLM 调用
+    # 注意: 用 batch_running 而非 running — running 在整个 daemon 线程生命周期都为 True
+    # (包括 60s 等待 trigger 时),会导致手动按钮永远点不动。
+    daemon = getattr(_app_state, "auto_llm_daemon", None)
+    if daemon is not None:
+        try:
+            ds = daemon.get_status()
+            if ds.get("batch_running"):
+                return jsonify({"error": "AutoLlmDaemon is running", "pending": ds.get("pending", 0)}), 409
+        except Exception as e:
+            logger.warning("Daemon status check failed: %s", e)
     acquired = _signal_lock.acquire(blocking=False)
     if not acquired:
         return jsonify({"error": "already running", "lock": "signal"}), 409
@@ -56,7 +75,12 @@ def signal_process():
         body = request.get_json(silent=True) or {}
         chat_id = body.get("chat_id")
         overwrite = body.get("overwrite", False)
-        started = _app_state.signal_service.start(chat_id=chat_id, overwrite=overwrite)
+        date_from = body.get("date_from")
+        date_to = body.get("date_to")
+        started = _app_state.signal_service.start(
+            chat_id=chat_id, overwrite=overwrite,
+            date_from=date_from, date_to=date_to,
+        )
         if not started:
             return jsonify({"error": "Signal processing already running"}), 409
         return jsonify({"status": "started"})

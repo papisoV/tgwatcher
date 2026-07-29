@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
 from typing import Callable
 
 from tgwatcher.signal_engine import SignalEngine
@@ -47,7 +46,8 @@ class SignalService:
             except Exception:
                 pass
 
-    def start(self, chat_id: int | None = None, overwrite: bool = False) -> bool:
+    def start(self, chat_id: int | None = None, overwrite: bool = False,
+              date_from: str | None = None, date_to: str | None = None) -> bool:
         with self._lock:
             if self._status["running"]:
                 return False
@@ -63,9 +63,16 @@ class SignalService:
             started_at=utc_now().isoformat(),
             finished_at=None,
         )
-        thread = threading.Thread(target=self._run_loop, args=(chat_id, overwrite), daemon=True)
+        thread = threading.Thread(
+            target=self._run_loop,
+            args=(chat_id, overwrite, date_from, date_to),
+            daemon=True,
+        )
         thread.start()
-        logger.info("Signal service started (overwrite=%s)", overwrite)
+        logger.info(
+            "Signal service started (chat_id=%s, overwrite=%s, date_from=%s, date_to=%s)",
+            chat_id, overwrite, date_from, date_to,
+        )
         return True
 
     def stop(self) -> bool:
@@ -77,11 +84,14 @@ class SignalService:
         logger.info("Signal service stop requested")
         return True
 
-    def _run_loop(self, chat_id: int | None, overwrite: bool) -> None:
+    def _run_loop(self, chat_id: int | None, overwrite: bool,
+                  date_from: str | None, date_to: str | None) -> None:
         try:
             result = self._engine.process_batch(
                 chat_id=chat_id,
                 overwrite=overwrite,
+                date_from=date_from,
+                date_to=date_to,
                 progress_callback=self._progress_callback,
                 stop_check=lambda: self._stop_event.is_set(),
             )

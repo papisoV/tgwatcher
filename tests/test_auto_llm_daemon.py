@@ -260,10 +260,11 @@ class TestGetStatus:
         status = d.get_status()
         assert isinstance(status, dict)
         assert set(status.keys()) == {
-            "running", "pending", "last_batch_at",
+            "running", "batch_running", "pending", "last_batch_at",
             "last_batch_count", "last_digest_at"
         }
-        # Before any batch runs, batch fields are None
+        # Before any batch runs, batch fields are None / False
+        assert status["batch_running"] is False
         assert status["last_batch_at"] is None
         assert status["last_batch_count"] is None
         assert status["last_digest_at"] is None

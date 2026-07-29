@@ -122,3 +122,85 @@ async function checkDaemonStatus(){
     console.warn('checkDaemonStatus error:',e);
   }
 }
+
+// ===== 处理指定范围 (手动触发 batch) =====
+let _signalProcessPollId=null;
+
+async function toggleSignalProcessForm(){
+  const form=document.getElementById('signalProcessForm');
+  if(!form)return;
+  const open=form.style.display==='none';
+  if(open){
+    // 填充群组下拉(只在首次打开时拉取)
+    const sel=document.getElementById('signalProcessChat');
+    if(sel.options.length<=1){
+      const chats=await api('/api/chats');
+      if(chats){
+        chats.forEach(c=>{
+          sel.insertAdjacentHTML('beforeend',
+            `<option value="${c.chat_id}">${esc(c.chat_title||'ID:'+c.chat_id)} (${c.msg_count})</option>`);
+        });
+      }
+    }
+    form.style.display='flex';
+  }else{
+    form.style.display='none';
+  }
+}
+
+async function startSignalProcess(){
+  const chatRaw=document.getElementById('signalProcessChat').value;
+  const dateFrom=document.getElementById('signalProcessDateFrom').value;
+  const dateTo=document.getElementById('signalProcessDateTo').value;
+  const overwrite=document.getElementById('signalProcessOverwrite').checked;
+  const hint=document.getElementById('signalProcessHint');
+  const btns=document.querySelectorAll('#signalProcessForm .btn-cyan');
+  const btn=btns[0]; if(btn)btn.disabled=true;
+  if(hint)hint.textContent='提交中...';
+  try{
+    const body={overwrite};
+    if(chatRaw)body.chat_id=parseInt(chatRaw,10);
+    if(dateFrom)body.date_from=dateFrom;
+    if(dateTo)body.date_to=dateTo;
+    const r=await api('/api/signal/process',{
+      method:'POST',
+      body:JSON.stringify(body),
+    });
+    if(!r){ if(hint)hint.textContent='提交失败 — 见日志'; btn.disabled=false; return; }
+    if(r.error){
+      if(hint)hint.textContent=r.error;
+      btn.disabled=false;
+      return;
+    }
+    if(hint)hint.textContent='已启动';
+    _pollSignalProcess();
+  }catch(e){
+    if(hint)hint.textContent='异常: '+e.message;
+    btn.disabled=false;
+  }
+}
+
+function _pollSignalProcess(){
+  const prog=document.getElementById('signalProgress');
+  if(_signalProcessPollId)clearInterval(_signalProcessPollId);
+  _signalProcessPollId=setInterval(async()=>{
+    try{
+      const s=await api('/api/signal/process/status');
+      if(!s)return;
+      if(s.running){
+        if(prog)prog.textContent=`处理中 ${s.processed}/${s.total} (完成 ${s.completed}, 失败 ${s.failed})`;
+      }else{
+        if(_signalProcessPollId){clearInterval(_signalProcessPollId);_signalProcessPollId=null;}
+        if(prog)prog.textContent='';
+        const hint=document.getElementById('signalProcessHint');
+        if(hint)hint.textContent=s.finished_at?`完成: ${s.completed}/${s.total} (失败 ${s.failed})`:'';
+        // 收起表单 + 刷新表格 + 重置"开始处理"按钮
+        const form=document.getElementById('signalProcessForm');
+        if(form)form.style.display='none';
+        const startBtns=document.querySelectorAll('#signalProcessForm .btn-cyan');
+        if(startBtns[0])startBtns[0].disabled=false;
+        loadSignalTab();
+      }
+    }catch(e){console.warn('poll error:',e);}
+  },1500);
+}
