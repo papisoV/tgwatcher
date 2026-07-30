@@ -29,7 +29,7 @@ async function loadMessages(page=1){
   const data=await api('/api/messages?'+params,{signal:ctrl.signal});
   if(!data)return;
   if(seq!==_msgReqSeq)return; // stale response, discard
-  totalMessages=data.total;const msgs=data.messages||[];
+  totalMessages=data.total||0;const msgs=data.messages||[];
   const tbody=document.getElementById('msgBody');
   if(!msgs.length){tbody.innerHTML='<tr><td colspan="4" style="text-align:center;padding:40px;color:var(--text-3)">暂无消息。请添加群组并开始爬取。</td></tr>'}
   else{tbody.innerHTML=msgs.map(m=>{
@@ -50,7 +50,7 @@ async function loadMessages(page=1){
       <td class="col-content">${chatTag}${editTag}${reply}${fwd}${ts}</td>
       <td>${medTag}</td></tr>`;
   }).join('')}
-  renderPagination(data.total,data.page,data.page_size);
+  renderPagination(data.total||0,data.page||1,data.page_size||pageSize);
 }
 
 function toggleRow(tr){

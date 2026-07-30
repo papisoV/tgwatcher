@@ -27,9 +27,9 @@ async function loadSignalTab(){
 async function loadSignalTrendChart(){
   const d=await api('/api/signal/trend?days=30');if(!d||!d.trend)return;
   const labels=Object.keys(d.trend).sort();
-  const avgDirection=labels.map(l=>(d.trend[l].avg_direction||0));
-  const avgMagnitude=labels.map(l=>(d.trend[l].avg_magnitude||0));
-  const counts=labels.map(l=>(d.trend[l].count||0));
+  const avgDirection=labels.map(l=>(d.trend[l]&&d.trend[l].avg_direction||0));
+  const avgMagnitude=labels.map(l=>(d.trend[l]&&d.trend[l].avg_magnitude||0));
+  const counts=labels.map(l=>(d.trend[l]&&d.trend[l].count||0));
   if(signalTrendChart)signalTrendChart.destroy();
   const el=document.getElementById('signalTrendChart');if(!el)return;
   signalTrendChart=new Chart(el,{type:'line',data:{labels,datasets:[
@@ -81,7 +81,9 @@ async function loadSignalTable(){
     const dir=f.direction||0;
     const dirColor=dir>0.1?'#00ff88':dir<-0.1?'#ff3d71':'#6b7a8d';
     const dirLabel=dir>0.1?'利多':dir<-0.1?'利空':'中性';
-    const symbols=JSON.parse(f.symbols||'[]').join(',');
+    let symbols=[];
+    try{symbols=JSON.parse(f.symbols||'[]')}catch(_){symbols=[]}
+    const symbolsStr=symbols.join(',');
     const text=esc((f.text||'').slice(0,50));
     const date=fmtTime(f.date);
     const score=computeSignalScore(f);

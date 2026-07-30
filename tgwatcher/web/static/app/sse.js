@@ -48,8 +48,8 @@ function connectSSE(){
       const dec=new TextDecoder();
       let buf='';
       const handlers={
-        crawl_status:e=>updateCrawlUI(JSON.parse(e.data)),
-        new_messages:e=>{if(!currentChat||currentChat===JSON.parse(e.data).chat_id)loadMessages(currentPage)},
+        crawl_status:e=>{try{updateCrawlUI(JSON.parse(e.data))}catch(_){}},
+        new_messages:e=>{try{const d=JSON.parse(e.data);if(!currentChat||currentChat===d.chat_id)loadMessages(currentPage)}catch(_){}},
         crawl_error:e=>{showToast(e.data,'error')},
         auto_poll_tick:e=>{try{JSON.parse(e.data);refreshAutoPollUI()}catch(_){}},
         listener_status:e=>{try{refreshListenerBadge(JSON.parse(e.data))}catch(_){}},

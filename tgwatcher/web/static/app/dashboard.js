@@ -106,7 +106,7 @@ async function loadDashboardTab(){
 async function loadTrendChart(){
   const days=parseInt(document.getElementById('trendPeriod')?.value)||30;
   const d=await api('/api/stats/trend?days='+days);if(!d||!d.labels)return;
-  const datasets=d.datasets.map((ds,i)=>({label:ds.chat_title,data:ds.data,borderColor:CHART_COLORS[i%CHART_COLORS.length],backgroundColor:CHART_COLORS[i%CHART_COLORS.length]+'18',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5}));
+  const datasets=(d.datasets||[]).map((ds,i)=>({label:ds.chat_title,data:ds.data,borderColor:CHART_COLORS[i%CHART_COLORS.length],backgroundColor:CHART_COLORS[i%CHART_COLORS.length]+'18',fill:true,tension:0.3,pointRadius:0,borderWidth:1.5}));
   if(trendChart)trendChart.destroy();const el=document.getElementById('trendChart');if(!el)return;
   trendChart=new Chart(el,{type:'line',data:{labels:d.labels,datasets},options:{..._chartOpts(),scales:_chartScales()}});
 }
@@ -116,7 +116,7 @@ async function loadHeatmap(){
   const canvas=document.getElementById('heatmapCanvas');if(!canvas)return;
   const ctx=canvas.getContext('2d');
   const W=canvas.width=canvas.parentElement.clientWidth||600,H=canvas.height=180;
-  const cellW=Math.floor(W/25),cellH=Math.floor(H/8),maxC=d.data.length?Math.max(1,...d.data.map(e=>e.count)):1;
+  const cellW=Math.floor(W/25),cellH=Math.floor(H/8),maxC=(d.data&&d.data.length)?Math.max(1,...d.data.map(e=>(e.count||0))):1;
   const light=_isLightTheme();
   const labelColor=light?'#718096':'#4a5568';
   const intenseTextColor=light?'#1a2030':'#e8ecf1';
@@ -140,7 +140,7 @@ async function loadComparisonChart(){
   if(comparisonChart)comparisonChart.destroy();const el=document.getElementById('comparisonChart');if(!el)return;
   const c=_chartColors();
   comparisonChart=new Chart(el,{type:'bar',data:{labels:top.map(g=>(g.chat_title||g.chat_id+'').slice(0,20)),datasets:[
-    {label:'消息数',data:top.map(g=>g.msg_count),backgroundColor:'#00e5ff33',borderColor:'#00e5ff',borderWidth:1},
-    {label:'发送者',data:top.map(g=>g.active_senders),backgroundColor:'#00ff8833',borderColor:'#00ff88',borderWidth:1},
+    {label:'消息数',data:top.map(g=>(g.msg_count||0)),backgroundColor:'#00e5ff33',borderColor:'#00e5ff',borderWidth:1},
+    {label:'发送者',data:top.map(g=>(g.active_senders||0)),backgroundColor:'#00ff8833',borderColor:'#00ff88',borderWidth:1},
   ]},options:{..._chartOpts(),indexAxis:'y',scales:{x:{grid:{color:c.grid},ticks:{color:c.tick,font:{family:"'JetBrains Mono'",size:10}},border:{color:c.border}},y:{grid:{color:c.grid},ticks:{color:c.legend,font:{size:11}},border:{color:c.border}}}}});
 }
