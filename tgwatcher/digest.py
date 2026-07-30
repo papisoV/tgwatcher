@@ -36,6 +36,9 @@ DEFAULT_HALFLIFE_MIN = 60    # fallback when signal's halflife_min is None/0
 
 DIGEST_PROMPT_TEMPLATE = """你是一个加密货币市场分析师。基于以下结构化信号数据，写一份简洁的中文市场摘要。
 
+【合规约束 — 必须严格遵守】
+所有币种/标的名称必须使用代号替代（如"标的A"、"标的B"），绝对禁止输出真实币种名称（如BTC、ETH、SOL等）。这是法律合规要求，违反即视为无效输出。
+
 数据时间窗口：{from_at} 到 {to_at}（本地时间，7 天窗口，半衰期加权）
 信号总数：{total}
 总权重（市场活跃度指标）：{total_weight:.2f}
@@ -57,16 +60,16 @@ DIGEST_PROMPT_TEMPLATE = """你是一个加密货币市场分析师。基于以�
 请输出以下格式（纯文本，不要 markdown 代码块）：
 
 【市场方向】
-一句话总结净方向 + 驱动因素
+一句话总结净方向 + 驱动因素（只用代号，禁止真实币名）
 
 【重点事件】
-2-4 条最值得关注的事件，每条包含：时间、标的、方向、一句话原因。优先选择 w 较高的近期事件。
+2-4 条最值得关注的事件，每条包含：时间、标的代号、方向、一句话原因。优先选择 w 较高的近期事件。禁止使用真实币名
 
 【风险提示】
-1-2 条仍未消化的风险（halflife_min 较长的利空事件，即使发生时间较早 w 仍较高）
+1-2 条仍未消化的风险（halflife_min 较长的利空事件，即使发生时间较早 w 仍较高）。只用代号，禁止真实币名
 
 【一句话展望】
-对接下来 12 小时的简短判断
+对接下来 12 小时的简短判断。只用代号，禁止真实币名
 """
 
 
@@ -326,8 +329,12 @@ def generate_digest(storage: Storage, llm: SignalLLMClient,
     # json_mode=False: free-form Chinese prose, not structured JSON.
     raw = llm._call_llm(prompt, max_tokens_override=1024, json_mode=False)
 
+    # Codename enforcement: replace any leaked real coin names with 标的X codes
+    from tgwatcher.codename_map import codename_map
+    safe_summary = codename_map.replace_names(raw.strip())
+
     digest = Digest(from_at=from_at, to_at=to_at, signal_count=count,
-                    summary=raw.strip())
+                    summary=safe_summary)
     with storage.get_session() as sess:
         sess.add(digest)
         sess.commit()
