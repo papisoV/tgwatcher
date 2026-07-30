@@ -438,10 +438,12 @@ class SignalEngine:
             return factor
         except Exception as e:
             logger.error("process_new_message failed for msg %d: %s", msg.get("message_id"), e)
-            # Set to pending so batch processor can retry
+            # Set to pending so batch processor can retry; include filter_result
+            # so count_pending picks it up (otherwise it's an invisible orphan).
             self._storage.save_signal_factor({
                 "message_id": msg["message_id"],
                 "chat_id": msg["chat_id"],
+                "filter_result": "passed",
                 "llm_status": "pending",
             })
             return None

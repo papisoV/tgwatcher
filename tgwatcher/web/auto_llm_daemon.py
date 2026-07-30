@@ -249,10 +249,10 @@ class AutoLlmDaemon:
         from sqlalchemy import text
         try:
             with self._storage.get_session() as sess:
-                # Source 1: pending signal_factors
+                # Source 1: pending/failed signal_factors (failed = retryable LLM errors)
                 r1 = sess.execute(text(
                     "SELECT COUNT(*) FROM signal_factors "
-                    "WHERE llm_status='pending' AND filter_result='passed'"
+                    "WHERE llm_status IN ('pending', 'failed') AND filter_result='passed'"
                 ))
                 pending_sf = int(r1.fetchone()[0])
                 # Source 2: messages without any signal_factors row

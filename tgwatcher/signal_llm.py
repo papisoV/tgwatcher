@@ -501,38 +501,51 @@ class SignalLLMClient:
             if key not in self._model_backoff:
                 self._model_backoff[key] = {
                     "busy_until": 0.0,
-                    "consecutive_503": 0.0,
+                    "consecutive_503": 0,
                     "rate_limit_until": 0.0,
                 }
             return self._model_backoff[key]
 
     def _mark_busy(self, provider: str, model: str) -> None:
         """Mark provider+model as 503-busy with escalating cooldown."""
-        state = self._get_backoff(provider, model)
-        state["consecutive_503"] += 1
-        cooldown = min(state["consecutive_503"] * 300, 1500) / 1000  # 0.3s→1.5s
-        state["busy_until"] = time.monotonic() + cooldown
-        logger.info(
-            "Model %s/%s 503 cooldown %.1fs (consecutive: %d)",
-            provider, model, cooldown, int(state["consecutive_503"]),
-        )
+        key = (provider, model)
+        with self._backoff_lock:
+            state = self._model_backoff.setdefault(key, {
+                "busy_until": 0.0, "consecutive_503": 0, "rate_limit_until": 0.0,
+            })
+            state["consecutive_503"] += 1
+            cooldown = min(state["consecutive_503"] * 0.3, 1.5)
+            state["busy_until"] = time.monotonic() + cooldown
+            n = state["consecutive_503"]
+        logger.info("Model %s/%s 503 cooldown %.1fs (consecutive: %d)", provider, model, cooldown, n)
 
     def _mark_rate_limited(self, provider: str, model: str, cooldown_s: float = 5.0) -> None:
-        state = self._get_backoff(provider, model)
-        state["rate_limit_until"] = max(state["rate_limit_until"], time.monotonic() + cooldown_s)
+        key = (provider, model)
+        with self._backoff_lock:
+            state = self._model_backoff.setdefault(key, {
+                "busy_until": 0.0, "consecutive_503": 0, "rate_limit_until": 0.0,
+            })
+            state["rate_limit_until"] = max(state["rate_limit_until"], time.monotonic() + cooldown_s)
         logger.info("Model %s/%s rate-limited cooldown %.1fs", provider, model, cooldown_s)
 
     def _mark_ok(self, provider: str, model: str) -> None:
-        state = self._get_backoff(provider, model)
-        state["consecutive_503"] = 0
-        state["busy_until"] = 0.0
-        state["rate_limit_until"] = 0.0
+        key = (provider, model)
+        with self._backoff_lock:
+            state = self._model_backoff.get(key)
+            if state:
+                state["consecutive_503"] = 0
+                state["busy_until"] = 0.0
+                state["rate_limit_until"] = 0.0
 
     def _wait_if_busy(self, provider: str, model: str) -> None:
         """Block until the model's cooldown expires."""
-        state = self._get_backoff(provider, model)
-        wait_until = max(state["busy_until"], state["rate_limit_until"])
-        wait = wait_until - time.monotonic()
+        key = (provider, model)
+        with self._backoff_lock:
+            state = self._model_backoff.get(key)
+            if not state:
+                return
+            wait_until = max(state["busy_until"], state["rate_limit_until"])
+            wait = wait_until - time.monotonic()
         if wait > 0:
             logger.info("Waiting %.1fs for %s/%s cooldown", wait, provider, model)
             time.sleep(wait)
@@ -711,8 +724,8 @@ class SignalLLMClient:
         """Call a specific provider's client. Used by `_call_with_fallback`.
 
         Routes to `_call_openai` or `_call_anthropic` based on the provider's
-        protocol. Temporarily swaps `self._client` and provider-specific model
-        so the existing protocol methods work unchanged.
+        protocol. Passes client/model/provider as explicit overrides so no
+        instance state swap is needed (thread-safe).
         """
         protocol = PROVIDER_PROTOCOLS.get(provider_name, "openai")
         # Resolve per-provider model: primary uses self._model, others use
@@ -723,36 +736,25 @@ class SignalLLMClient:
             pcfg = self._config.providers.get(provider_name, {})
             model = pcfg.get("model", self._model)
 
-        # Temporarily swap state so _call_openai/_call_anthropic use the
-        # fallback provider's client + model. Restore in finally to keep
-        # object state consistent for callers reading self._client/_model.
-        prev_client = self._client
-        prev_provider = self._provider
-        prev_model = self._model
-        prev_protocol = self._protocol
-        self._client = client
-        self._provider = provider_name
-        self._model = model
-        self._protocol = protocol
-        try:
-            if protocol == "openai":
-                return self._call_openai(
-                    prompt,
-                    max_tokens_override=max_tokens_override,
-                    json_mode=json_mode,
-                )
-            elif protocol == "anthropic":
-                return self._call_anthropic(
-                    prompt,
-                    max_tokens_override=max_tokens_override,
-                    json_mode=json_mode,
-                )
-            raise ValueError(f"Unhandled protocol: {protocol}")
-        finally:
-            self._client = prev_client
-            self._provider = prev_provider
-            self._model = prev_model
-            self._protocol = prev_protocol
+        if protocol == "openai":
+            return self._call_openai(
+                prompt,
+                max_tokens_override=max_tokens_override,
+                json_mode=json_mode,
+                _client=client,
+                _model=model,
+                _provider=provider_name,
+            )
+        elif protocol == "anthropic":
+            return self._call_anthropic(
+                prompt,
+                max_tokens_override=max_tokens_override,
+                json_mode=json_mode,
+                _client=client,
+                _model=model,
+                _provider=provider_name,
+            )
+        raise ValueError(f"Unhandled protocol: {protocol}")
 
     # Max in-provider retries for transient errors (503/429) before falling back
     _IN_PROVIDER_RETRIES = 3
@@ -783,9 +785,9 @@ class SignalLLMClient:
             model = self._provider_models.get(provider_name, "unknown")
 
             for attempt in range(1, self._IN_PROVIDER_RETRIES + 1):
-                # Wait if this model is in cooldown
-                if attempt > 1:
-                    self._wait_if_busy(provider_name, model)
+                # Wait if this model is in cooldown (even on first attempt —
+                # a prior call may have left it busy).
+                self._wait_if_busy(provider_name, model)
 
                 try:
                     result = self._call_llm_with_provider(
@@ -812,6 +814,12 @@ class SignalLLMClient:
                     self._mark_ok(provider_name, model)
                     return result
 
+                except LLMTruncatedError:
+                    # Truncation is not transient — same provider will truncate again
+                    # with same max_tokens. Fall through to next provider (may have
+                    # larger budget or different model).
+                    logger.warning("Provider %s output truncated, trying next provider", provider_name)
+                    break
                 except Exception as e:
                     last_error = e
                     status = getattr(e, "status_code", None)
@@ -864,7 +872,9 @@ class SignalLLMClient:
         raise RuntimeError("No LLM providers available — client pool is empty.")
 
     def _call_openai(self, prompt: str, max_tokens_override: int | None = None,
-                     json_mode: bool = True) -> str:
+                     json_mode: bool = True,
+                     _client: Any = None, _model: str | None = None,
+                     _provider: str | None = None) -> str:
         """Call OpenAI-compatible chat completion endpoint.
 
         Uses `response_format={"type":"json_object"}` for structured output when
@@ -876,10 +886,15 @@ class SignalLLMClient:
                 passes a larger budget so multi-message reasoning isn't clipped).
             json_mode: If False, omit response_format for free-form text output
                 (digest summaries, conversational responses).
+            _client/_model/_provider: Internal overrides for fallback calls
+                (avoids swapping instance state, thread-safe).
         """
+        client = _client or self._client
+        model = _model or self._model
+        provider = _provider or self._provider
         max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
         kwargs = {
-            "model": self._model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self._temperature,
             "max_tokens": max_tokens,
@@ -887,7 +902,7 @@ class SignalLLMClient:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         try:
-            response = self._client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
         except Exception as e:
             # Surface provider/model/status context for 503/429/debugging. The
             # openai SDK retries internally (max_retries) and re-raises — we log
@@ -896,8 +911,8 @@ class SignalLLMClient:
             logger.warning(
                 "OpenAI call failed",
                 extra={
-                    "provider": self._provider,
-                    "model": self._model,
+                    "provider": provider,
+                    "model": model,
                     "max_tokens": max_tokens,
                     "json_mode": json_mode,
                     "status": status,
@@ -919,7 +934,9 @@ class SignalLLMClient:
         return choice.message.content.strip()
 
     def _call_anthropic(self, prompt: str, max_tokens_override: int | None = None,
-                        json_mode: bool = True) -> str:
+                        json_mode: bool = True,
+                        _client: Any = None, _model: str | None = None,
+                        _provider: str | None = None) -> str:
         """Call Anthropic Messages API.
 
         Uses ANTHROPIC_JSON_SYSTEM_PROMPT to force JSON output (Anthropic has no
@@ -929,14 +946,19 @@ class SignalLLMClient:
         Args:
             json_mode: If False, use a neutral system prompt for free-form text
                 output (digest summaries, conversational responses).
+            _client/_model/_provider: Internal overrides for fallback calls
+                (avoids swapping instance state, thread-safe).
         """
+        client = _client or self._client
+        model = _model or self._model
+        provider = _provider or self._provider
         max_tokens = max_tokens_override if max_tokens_override is not None else self._max_tokens
         system_prompt = ANTHROPIC_JSON_SYSTEM_PROMPT if json_mode else (
             "You are a helpful assistant. Respond in natural language."
         )
         try:
-            response = self._client.messages.create(
-                model=self._model,
+            response = client.messages.create(
+                model=model,
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=self._temperature,
@@ -947,8 +969,8 @@ class SignalLLMClient:
             logger.warning(
                 "Anthropic call failed",
                 extra={
-                    "provider": self._provider,
-                    "model": self._model,
+                    "provider": provider,
+                    "model": model,
                     "max_tokens": max_tokens,
                     "json_mode": json_mode,
                     "status": status,
@@ -1027,7 +1049,6 @@ class SignalLLMClient:
             if attempt < self._max_retries - 1:
                 delay = 2 ** attempt  # 1s, 2s, 4s
                 logger.info("Retrying in %d seconds...", delay)
-                import time
                 time.sleep(delay)
 
         raise LLMRefineError(f"LLM refine failed after {self._max_retries} attempts")
@@ -1132,7 +1153,6 @@ class SignalLLMClient:
             if attempt < self._max_retries - 1:
                 delay = 2 ** attempt
                 logger.info("Retrying batch in %d seconds...", delay)
-                import time
                 time.sleep(delay)
 
         # All retries failed — fall back to individual refine()
