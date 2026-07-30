@@ -58,6 +58,7 @@ class BotPusher:
         self._fail_count: int = 0
         self._last_push_at: datetime | None = None
         self._storage = None  # Set via set_storage() after DB init
+        self._quota_counter: dict[tuple[int, str], int] = {}  # (chat_id, date_str) → count
 
         try:
             bot_cfg = config.get("bot", {}) or {}
@@ -99,21 +100,26 @@ class BotPusher:
         """Get chat_ids that should receive this signal.
 
         Queries bot_subscriptions from DB when storage is available,
-        applying min_score and event_types filters. Falls back to
-        static chat_ids from config when storage is None.
+        applying status, min_score, event_types, and quota filters.
+        Falls back to static chat_ids from config when storage is None.
         """
         signal_score = abs(signal_payload.get("signal_score", 0))
         event_type = signal_payload.get("event_type", "")
 
         if self._storage is not None:
             try:
-                from tgwatcher.models import BotSubscription
+                from tgwatcher.models import BotSubscription, SubscriptionPlan
+                from datetime import datetime, timezone
                 with self._storage.get_session() as sess:
                     subs = sess.query(BotSubscription).filter(
                         BotSubscription.enabled == True,
+                        BotSubscription.status == "active",
                     ).all()
                     chat_ids = []
                     for sub in subs:
+                        # Expiry check
+                        if sub.expires_at and sub.expires_at.replace(tzinfo=None) < datetime.now(timezone.utc).replace(tzinfo=None):
+                            continue
                         # min_score filter
                         if signal_score < (sub.min_score or 0.0):
                             continue
@@ -125,6 +131,9 @@ class BotPusher:
                                     continue
                             except (json.JSONDecodeError, TypeError):
                                 pass
+                        # Quota check
+                        if sub.plan_id and not self._check_quota(sess, sub):
+                            continue
                         chat_ids.append(sub.chat_id)
                     return chat_ids
             except Exception as e:
@@ -132,6 +141,31 @@ class BotPusher:
 
         # Fallback: static chat_ids from config
         return list(self._chat_ids)
+
+    def _check_quota(self, sess, sub) -> bool:
+        """Check if subscription has remaining daily signal quota.
+
+        Returns True if quota allows this signal, False if over limit.
+        Quota of 0 means unlimited.
+        """
+        if not sub.plan_id:
+            return True  # No plan = legacy, no quota
+        from tgwatcher.models import SubscriptionPlan
+        plan = sess.query(SubscriptionPlan).get(sub.plan_id)
+        if not plan or plan.max_signals_per_day == 0:
+            return True  # Unlimited quota
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        quota_key = (sub.chat_id, today_key)
+        used = self._quota_counter.get(quota_key, 0)
+        if used >= plan.max_signals_per_day:
+            return False
+        return True
+
+    def _record_quota_use(self, chat_id: int) -> None:
+        """Increment daily quota counter after successful push."""
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        quota_key = (chat_id, today_key)
+        self._quota_counter[quota_key] = self._quota_counter.get(quota_key, 0) + 1
 
     def dispatch(self, signal_payload: dict) -> None:
         """Async-dispatch signal to matching subscribers. Returns immediately."""
@@ -236,6 +270,7 @@ class BotPusher:
                 with self._lock:
                     self._success_count += 1
                     self._last_push_at = datetime.now(timezone.utc)
+                self._record_quota_use(chat_id)
                 logger.info("Bot push to chat %d: OK", chat_id)
             else:
                 self._record_failure(chat_id, f"HTTP {r.status_code}: {r.text[:200]}")

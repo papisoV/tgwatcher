@@ -131,6 +131,34 @@ class AppState:
         # Wire storage reference after DB init so BotPusher can query subscriptions.
         self.bot_pusher.set_storage(self.storage)
 
+        # Data retention cleaner — deletes old data per compliance config.
+        from tgwatcher.compliance import DataRetentionCleaner
+        compliance_cfg = config.get("compliance", {})
+        retention_days = int(compliance_cfg.get("data_retention_days", 365))
+        if retention_days > 0:
+            self.retention_cleaner = DataRetentionCleaner(
+                self.storage, retention_days=retention_days,
+            )
+            threading.Thread(
+                target=self.retention_cleaner.run_loop,
+                daemon=True,
+                name="data-retention",
+            ).start()
+            logger.info("Data retention cleaner started (retention_days=%d)", retention_days)
+        else:
+            self.retention_cleaner = None
+            logger.info("Data retention cleaner disabled (retention_days=0)")
+
+        # Subscription expiry checker — marks expired subscriptions.
+        from tgwatcher.subscription_checker import SubscriptionChecker
+        self.subscription_checker = SubscriptionChecker(self.storage)
+        threading.Thread(
+            target=self.subscription_checker.run_loop,
+            daemon=True,
+            name="subscription-checker",
+        ).start()
+        logger.info("Subscription expiry checker started")
+
         # Auto-catchup on startup
         catchup_cfg = config.get("catchup", {})
         if catchup_cfg.get("enabled", True):
@@ -187,6 +215,10 @@ class AppState:
             _api._auto_poll_shutdown.set()
             if self.auto_llm_daemon is not None:
                 self.auto_llm_daemon.signal_shutdown()
+            if self.retention_cleaner is not None:
+                self.retention_cleaner.signal_shutdown()
+            if self.subscription_checker is not None:
+                self.subscription_checker.signal_shutdown()
 
         atexit.register(_shutdown_daemons)
         try:

@@ -145,6 +145,26 @@ class Digest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
 
 
+class SubscriptionPlan(Base):
+    """Subscription plan for bot signal push.
+
+    Defines pricing tiers with signal quotas and feature flags.
+    Seeded with 3 default plans on fresh DB (free/pro/enterprise).
+    """
+    __tablename__ = "subscription_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    price_cents: Mapped[int] = mapped_column(Integer, default=0)  # Price in cents (0 = free)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    interval_days: Mapped[int] = mapped_column(Integer, default=30)  # Billing cycle length
+    max_signals_per_day: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
+    features_json: Mapped[str | None] = mapped_column(Text)  # JSON dict of feature flags
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+
+
 class BotSubscription(Base):
     """Telegram chat subscription for bot signal push.
 
@@ -158,5 +178,8 @@ class BotSubscription(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     min_score: Mapped[float] = mapped_column(Float, default=0.0)
     event_types: Mapped[str | None] = mapped_column(Text)  # JSON array: '["market","whale"]' or NULL=all
+    plan_id: Mapped[int | None] = mapped_column(Integer)  # FK→subscription_plans.id (no SQLAlchemy FK constraint)
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active/expired/cancelled/trial
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)  # NULL = never expires
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))

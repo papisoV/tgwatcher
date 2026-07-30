@@ -194,6 +194,10 @@ signal:
 catchup:
   enabled: true
   limit: 1000
+compliance:
+  data_retention_days: 365    # Auto-delete data older than N days (0 = disabled)
+  privacy_policy_path: ""     # Path to custom privacy policy markdown (empty = default)
+  tos_path: ""                # Path to custom terms of service markdown (empty = default)
 webhook:
   enabled: false
   timeout_seconds: 5

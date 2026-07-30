@@ -181,4 +181,4 @@ class TestMigrationV10:
             assert result.fetchone() is not None, "bot_subscriptions table should exist"
 
         from tgwatcher.storage.repositories.migration import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 10
+        assert SCHEMA_VERSION >= 10

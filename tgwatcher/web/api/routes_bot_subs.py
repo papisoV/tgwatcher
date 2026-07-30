@@ -10,6 +10,7 @@ Routes:
 import json
 import logging
 
+from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
 
 from tgwatcher.models import BotSubscription
@@ -18,6 +19,16 @@ from ._legacy import _app_state, require_auth
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("bot_subscriptions", __name__, url_prefix="")
+
+
+def _parse_expires_at(value) -> datetime | None:
+    """Parse expires_at from ISO string or None."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
 
 
 @bp.route("/api/bot/subscriptions", methods=["GET"])
@@ -37,6 +48,9 @@ def list_subscriptions():
                 "enabled": s.enabled,
                 "min_score": s.min_score,
                 "event_types": json.loads(s.event_types) if s.event_types else None,
+                "plan_id": s.plan_id,
+                "status": s.status,
+                "expires_at": s.expires_at.isoformat() if s.expires_at else None,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
             }
@@ -76,6 +90,9 @@ def create_subscription():
         enabled=bool(data.get("enabled", True)),
         min_score=min_score,
         event_types=event_types_json,
+        plan_id=int(data["plan_id"]) if data.get("plan_id") else None,
+        status=str(data.get("status", "active")),
+        expires_at=_parse_expires_at(data.get("expires_at")),
     )
 
     try:
@@ -89,6 +106,9 @@ def create_subscription():
                 "enabled": sub.enabled,
                 "min_score": sub.min_score,
                 "event_types": json.loads(sub.event_types) if sub.event_types else None,
+                "plan_id": sub.plan_id,
+                "status": sub.status,
+                "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
             }), 201
     except Exception as e:
         if "UNIQUE constraint" in str(e):
@@ -119,6 +139,12 @@ def update_subscription(sub_id: int):
         if "event_types" in data:
             et = data["event_types"]
             sub.event_types = json.dumps(et) if et is not None else None
+        if "plan_id" in data:
+            sub.plan_id = int(data["plan_id"]) if data["plan_id"] else None
+        if "status" in data:
+            sub.status = str(data["status"])
+        if "expires_at" in data:
+            sub.expires_at = _parse_expires_at(data["expires_at"])
         sub.updated_at = _app_state.storage._now() if hasattr(_app_state.storage, '_now') else None
 
         sess.commit()
@@ -129,6 +155,9 @@ def update_subscription(sub_id: int):
             "enabled": sub.enabled,
             "min_score": sub.min_score,
             "event_types": json.loads(sub.event_types) if sub.event_types else None,
+            "plan_id": sub.plan_id,
+            "status": sub.status,
+            "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
         })
 
 

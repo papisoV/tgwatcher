@@ -15,11 +15,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import Engine
 
-from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest, BotSubscription
+from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest, BotSubscription, SubscriptionPlan
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class MigrationRunner:
@@ -66,6 +66,8 @@ class MigrationRunner:
             self._migrate_v8_to_v9()
         if from_version < 10:
             self._migrate_v9_to_v10()
+        if from_version < 11:
+            self._migrate_v10_to_v11()
         logger.info(
             "Schema migration complete",
             extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_complete"},
@@ -230,3 +232,50 @@ class MigrationRunner:
             conn.commit()
         self.set_schema_version(10)
         logger.info("Migration v9 -> v10 complete")
+
+    def _migrate_v10_to_v11(self) -> None:
+        """Create subscription_plans table + add plan_id/status/expires_at to bot_subscriptions."""
+        logger.info("Migrating schema v10 -> v11 (subscription_plans + bot_subscriptions extensions) ...")
+        with self.engine.connect() as conn:
+            # Create subscription_plans table
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS subscription_plans ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  name VARCHAR(64) NOT NULL UNIQUE,"
+                "  price_cents INTEGER DEFAULT 0,"
+                "  currency VARCHAR(8) DEFAULT 'CNY',"
+                "  interval_days INTEGER DEFAULT 30,"
+                "  max_signals_per_day INTEGER DEFAULT 0,"
+                "  features_json TEXT,"
+                "  enabled BOOLEAN DEFAULT 1,"
+                "  created_at DATETIME DEFAULT (datetime('now')),"
+                "  updated_at DATETIME DEFAULT (datetime('now'))"
+                ")"
+            ))
+            # Seed 3 default plans (individual inserts to avoid SQLAlchemy :bindparam parsing issues)
+            for name, price, max_day, features in [
+                ("free", 0, 10, '{"codename_only":true}'),
+                ("pro", 2900, 100, '{"codename_only":true,"digest":true}'),
+                ("enterprise", 9900, 0, '{"codename_only":true,"digest":true,"webhook":true,"api_access":true}'),
+            ]:
+                conn.execute(text(
+                    "INSERT OR IGNORE INTO subscription_plans "
+                    "(name, price_cents, currency, interval_days, max_signals_per_day, features_json, enabled) "
+                    "VALUES (:name, :price, 'CNY', 30, :max_day, :features, 1)"
+                ), {"name": name, "price": price, "max_day": max_day, "features": features})
+            # Add columns to bot_subscriptions
+            for col_name, col_type, col_default in [
+                ("plan_id", "INTEGER", None),
+                ("status", "VARCHAR(20)", "'active'"),
+                ("expires_at", "DATETIME", None),
+            ]:
+                try:
+                    alter = f"ALTER TABLE bot_subscriptions ADD COLUMN {col_name} {col_type}"
+                    if col_default:
+                        alter += f" DEFAULT {col_default}"
+                    conn.execute(text(alter))
+                except OperationalError:
+                    pass  # Column already exists
+            conn.commit()
+        self.set_schema_version(11)
+        logger.info("Migration v10 -> v11 complete")
