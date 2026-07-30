@@ -15,11 +15,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import Engine
 
-from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest
+from tgwatcher.models import Base, SignalFactor, SignalOutcome, Digest, BotSubscription
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class MigrationRunner:
@@ -64,6 +64,8 @@ class MigrationRunner:
             self._migrate_v7_to_v8()
         if from_version < 9:
             self._migrate_v8_to_v9()
+        if from_version < 10:
+            self._migrate_v9_to_v10()
         logger.info(
             "Schema migration complete",
             extra={"from_version": from_version, "to_version": SCHEMA_VERSION, "action": "migrate_complete"},
@@ -205,3 +207,26 @@ class MigrationRunner:
             conn.commit()
         self.set_schema_version(9)
         logger.info("Migration v8 -> v9 complete")
+
+    def _migrate_v9_to_v10(self) -> None:
+        """Create bot_subscriptions table for Telegram Bot push subscriptions."""
+        logger.info("Migrating schema v9 -> v10 (bot_subscriptions table) ...")
+        with self.engine.connect() as conn:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS bot_subscriptions ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  chat_id BIGINT NOT NULL UNIQUE,"
+                "  enabled BOOLEAN DEFAULT 1,"
+                "  min_score REAL DEFAULT 0.0,"
+                "  event_types TEXT,"
+                "  created_at DATETIME DEFAULT (datetime('now')),"
+                "  updated_at DATETIME DEFAULT (datetime('now'))"
+                ")"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_bot_subscriptions_chat_id "
+                "ON bot_subscriptions (chat_id)"
+            ))
+            conn.commit()
+        self.set_schema_version(10)
+        logger.info("Migration v9 -> v10 complete")

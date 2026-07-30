@@ -128,6 +128,8 @@ class AppState:
         # Bot pusher — Telegram Bot API push for new signals.
         from tgwatcher.bot_push import BotPusher
         self.bot_pusher = BotPusher(config.get("signal", {}))
+        # Wire storage reference after DB init so BotPusher can query subscriptions.
+        self.bot_pusher.set_storage(self.storage)
 
         # Auto-catchup on startup
         catchup_cfg = config.get("catchup", {})

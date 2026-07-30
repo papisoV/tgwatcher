@@ -38,6 +38,11 @@ class BotPusher:
 
     Thread-safe. Failed sends are logged + counted but never block.
     All output uses codename enforcement (标的X codes, no real coin names).
+
+    Subscription model:
+      - If _storage is set, dispatch() queries bot_subscriptions for enabled
+        subscribers with matching filters (min_score, event_types).
+      - Falls back to static chat_ids from config when _storage is None.
     """
 
     def __init__(self, config: dict) -> None:
@@ -52,6 +57,7 @@ class BotPusher:
         self._success_count: int = 0
         self._fail_count: int = 0
         self._last_push_at: datetime | None = None
+        self._storage = None  # Set via set_storage() after DB init
 
         try:
             bot_cfg = config.get("bot", {}) or {}
@@ -62,35 +68,82 @@ class BotPusher:
             self._max_workers = int(bot_cfg.get("max_workers", 4))
             self._chat_ids = [int(cid) for cid in (bot_cfg.get("chat_ids") or []) if cid]
 
-            if self._enabled and self._token and self._chat_ids:
+            if self._enabled and self._token:
                 self._executor = ThreadPoolExecutor(
                     max_workers=self._max_workers,
                     thread_name_prefix="bot-push",
                 )
                 logger.info(
-                    "BotPusher initialized: %d chat(s), parse_mode=%s",
-                    len(self._chat_ids), self._parse_mode,
+                    "BotPusher initialized: token=%s, static_chats=%d, parse_mode=%s",
+                    bool(self._token), len(self._chat_ids), self._parse_mode,
                 )
             else:
                 logger.info(
-                    "BotPusher disabled (enabled=%s, token=%s, chats=%d)",
-                    self._enabled, bool(self._token), len(self._chat_ids),
+                    "BotPusher disabled (enabled=%s, token=%s)",
+                    self._enabled, bool(self._token),
                 )
         except Exception as e:
             logger.error("BotPusher init failed: %s", e, exc_info=True)
             self._enabled = False
 
+    def set_storage(self, storage) -> None:
+        """Wire in Storage reference for subscription queries."""
+        self._storage = storage
+        logger.info("BotPusher: storage reference set")
+
     @property
     def enabled(self) -> bool:
-        return self._enabled and bool(self._token) and bool(self._chat_ids)
+        return self._enabled and bool(self._token)
+
+    def _get_subscribers(self, signal_payload: dict) -> list[int]:
+        """Get chat_ids that should receive this signal.
+
+        Queries bot_subscriptions from DB when storage is available,
+        applying min_score and event_types filters. Falls back to
+        static chat_ids from config when storage is None.
+        """
+        signal_score = abs(signal_payload.get("signal_score", 0))
+        event_type = signal_payload.get("event_type", "")
+
+        if self._storage is not None:
+            try:
+                from tgwatcher.models import BotSubscription
+                with self._storage.get_session() as sess:
+                    subs = sess.query(BotSubscription).filter(
+                        BotSubscription.enabled == True,
+                    ).all()
+                    chat_ids = []
+                    for sub in subs:
+                        # min_score filter
+                        if signal_score < (sub.min_score or 0.0):
+                            continue
+                        # event_types filter (NULL or empty = all types)
+                        if sub.event_types:
+                            try:
+                                allowed = json.loads(sub.event_types)
+                                if isinstance(allowed, list) and allowed and event_type not in allowed:
+                                    continue
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        chat_ids.append(sub.chat_id)
+                    return chat_ids
+            except Exception as e:
+                logger.warning("BotPusher: subscription query failed, falling back to static chat_ids: %s", e)
+
+        # Fallback: static chat_ids from config
+        return list(self._chat_ids)
 
     def dispatch(self, signal_payload: dict) -> None:
-        """Async-dispatch signal to all configured chat_ids. Returns immediately."""
+        """Async-dispatch signal to matching subscribers. Returns immediately."""
         if not self.enabled or not self._executor:
             return
 
+        chat_ids = self._get_subscribers(signal_payload)
+        if not chat_ids:
+            return
+
         text = self.format_signal(signal_payload)
-        for chat_id in self._chat_ids:
+        for chat_id in chat_ids:
             self._executor.submit(self._send, chat_id, text)
 
     def format_signal(self, payload: dict) -> str:
@@ -196,10 +249,21 @@ class BotPusher:
 
     def get_status(self) -> dict:
         """Return status snapshot for GET /api/bot/status."""
+        sub_count = 0
+        if self._storage is not None:
+            try:
+                from tgwatcher.models import BotSubscription
+                with self._storage.get_session() as sess:
+                    sub_count = sess.query(BotSubscription).filter(
+                        BotSubscription.enabled == True,
+                    ).count()
+            except Exception:
+                pass
         with self._lock:
             return {
                 "enabled": self.enabled,
                 "chat_ids": list(self._chat_ids),
+                "subscription_count": sub_count,
                 "last_push_at": (
                     self._last_push_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
                     if self._last_push_at else None
@@ -224,7 +288,7 @@ class BotPusher:
         logger.info("BotPusher config updated: enabled=%s, chats=%d", self._enabled, len(self._chat_ids))
 
     def send_test(self) -> dict:
-        """Send a test signal to all configured chat_ids."""
+        """Send a test signal to all subscribers (or static chat_ids as fallback)."""
         test_payload = {
             "message_id": 0,
             "chat_id": 0,
@@ -247,7 +311,11 @@ class BotPusher:
         if not self.enabled:
             return {"status": "disabled", "results": []}
 
-        for chat_id in self._chat_ids:
+        chat_ids = self._get_subscribers(test_payload)
+        if not chat_ids:
+            return {"status": "no_subscribers", "results": []}
+
+        for chat_id in chat_ids:
             url = f"{_TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
             payload = {"chat_id": chat_id, "text": text, "parse_mode": self._parse_mode}
             try:

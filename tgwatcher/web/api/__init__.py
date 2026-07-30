@@ -62,6 +62,7 @@ from ._legacy import (  # noqa: F401
 
 from .routes_auth import bp as auth_bp
 from .routes_bot import bp as bot_bp
+from .routes_bot_subs import bp as bot_subs_bp
 from .routes_config import bp as config_bp
 from .routes_crawl import bp as crawl_bp
 from .routes_digest import bp as digest_bp
@@ -75,6 +76,7 @@ from .routes_webhook import bp as webhook_bp
 
 api.register_blueprint(auth_bp)
 api.register_blueprint(bot_bp)
+api.register_blueprint(bot_subs_bp)
 api.register_blueprint(config_bp)
 api.register_blueprint(crawl_bp)
 api.register_blueprint(digest_bp)

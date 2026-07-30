@@ -143,3 +143,20 @@ class Digest(Base):
     signal_count: Mapped[int] = mapped_column(Integer, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+
+
+class BotSubscription(Base):
+    """Telegram chat subscription for bot signal push.
+
+    Each row represents one chat_id that wants to receive signal push
+    notifications, with optional filters for minimum score and event types.
+    """
+    __tablename__ = "bot_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    min_score: Mapped[float] = mapped_column(Float, default=0.0)
+    event_types: Mapped[str | None] = mapped_column(Text)  # JSON array: '["market","whale"]' or NULL=all
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), server_default=sa_text("(datetime('now'))"))
