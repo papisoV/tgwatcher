@@ -24,8 +24,10 @@ Schema v2: direction/magnitude/urgency/confidence/halflife_min/symbols.
 
 import json
 import logging
+import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +36,24 @@ import httpx
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+# GLM refusal detection patterns (Chinese model safety rejections)
+REFUSAL_PATTERNS = [
+    "作为AI", "作为人工", "作为一个人", "我无法", "我不能",
+    "我还没学习", "我还没有学习", "内容涉及", "请换个话题",
+    "我无法回答", "我不能回答", "我无法提供", "我不能提供",
+    "内容涉及敏感",
+]
+
+
+def _is_refusal(text: str) -> bool:
+    """Check if LLM response text is a Chinese safety refusal."""
+    if not text:
+        return False
+    for pattern in REFUSAL_PATTERNS:
+        if pattern in text:
+            return True
+    return False
 
 # Provider -> wire protocol. Unknown providers fail-fast at config load.
 PROVIDER_PROTOCOLS = {
@@ -340,16 +360,19 @@ class SignalLLMClient:
         # (e.g. anthropic SDK missing) are skipped — they'll be filtered out
         # of the fallback chain rather than crashing the whole client.
         self._clients: dict[str, Any] = {}
+        self._provider_models: dict[str, str] = {}  # provider_name → model name
         for provider_name in config.fallback_order:
             # Primary provider's credentials live at top-level config fields;
             # secondary providers come from the providers dict.
             if provider_name == config.provider:
                 p_base_url = config.base_url
                 p_api_key = config.api_key
+                p_model = config.model
             else:
                 pcfg = config.providers.get(provider_name, {})
                 p_base_url = pcfg.get("base_url", "")
                 p_api_key = pcfg.get("api_key", "")
+                p_model = pcfg.get("model", "unknown")
 
             protocol = PROVIDER_PROTOCOLS.get(provider_name, "openai")
             try:
@@ -360,6 +383,7 @@ class SignalLLMClient:
                         timeout=timeout,
                         max_retries=0,  # fallback chain handles retries
                     )
+                    self._provider_models[provider_name] = p_model
                 elif protocol == "anthropic":
                     try:
                         from anthropic import Anthropic
@@ -377,6 +401,7 @@ class SignalLLMClient:
                         timeout=timeout,
                         max_retries=0,
                     )
+                    self._provider_models[provider_name] = p_model
                 else:
                     logger.warning(
                         "Provider %s skipped: unknown protocol %r",
@@ -416,6 +441,11 @@ class SignalLLMClient:
         # hits the same overloaded backend. A 2s pause gives it room to recover.
         self._fallback_delay_seconds = 2.0
         self._config = config
+
+        # Per-model backoff state for 503/429 smart retry (mirrors glm-proxy logic).
+        # Key: (provider_name, model), Value: {busy_until, consecutive_503, rate_limit_until}
+        self._model_backoff: dict[tuple[str, str], dict[str, float]] = {}
+        self._backoff_lock = threading.Lock()
 
         logger.info(
             "SignalLLMClient initialized",
@@ -462,6 +492,88 @@ class SignalLLMClient:
         if cls_name in ("APITimeoutError", "APIConnectionError"):
             return True
         return False
+
+    # ---- Per-model backoff (mirrors glm-proxy 503/429 logic) ----
+
+    def _get_backoff(self, provider: str, model: str) -> dict[str, float]:
+        key = (provider, model)
+        with self._backoff_lock:
+            if key not in self._model_backoff:
+                self._model_backoff[key] = {
+                    "busy_until": 0.0,
+                    "consecutive_503": 0.0,
+                    "rate_limit_until": 0.0,
+                }
+            return self._model_backoff[key]
+
+    def _mark_busy(self, provider: str, model: str) -> None:
+        """Mark provider+model as 503-busy with escalating cooldown."""
+        state = self._get_backoff(provider, model)
+        state["consecutive_503"] += 1
+        cooldown = min(state["consecutive_503"] * 300, 1500) / 1000  # 0.3s→1.5s
+        state["busy_until"] = time.monotonic() + cooldown
+        logger.info(
+            "Model %s/%s 503 cooldown %.1fs (consecutive: %d)",
+            provider, model, cooldown, int(state["consecutive_503"]),
+        )
+
+    def _mark_rate_limited(self, provider: str, model: str, cooldown_s: float = 5.0) -> None:
+        state = self._get_backoff(provider, model)
+        state["rate_limit_until"] = max(state["rate_limit_until"], time.monotonic() + cooldown_s)
+        logger.info("Model %s/%s rate-limited cooldown %.1fs", provider, model, cooldown_s)
+
+    def _mark_ok(self, provider: str, model: str) -> None:
+        state = self._get_backoff(provider, model)
+        state["consecutive_503"] = 0
+        state["busy_until"] = 0.0
+        state["rate_limit_until"] = 0.0
+
+    def _wait_if_busy(self, provider: str, model: str) -> None:
+        """Block until the model's cooldown expires."""
+        state = self._get_backoff(provider, model)
+        wait_until = max(state["busy_until"], state["rate_limit_until"])
+        wait = wait_until - time.monotonic()
+        if wait > 0:
+            logger.info("Waiting %.1fs for %s/%s cooldown", wait, provider, model)
+            time.sleep(wait)
+
+    @staticmethod
+    def _parse_upstream_error(status_code: int, body: str) -> dict[str, Any]:
+        """Classify upstream HTTP error. Returns {retryable, reason, code}."""
+        parsed = None
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 429 + auth failure → not retryable
+        if status_code == 429:
+            code = (parsed or {}).get("error", {}).get("code")
+            msg = (parsed or {}).get("error", {}).get("message", "")
+            if code == 11210 or "authorization failed" in msg.lower() or "auth" in msg.lower():
+                return {"retryable": False, "reason": "auth_failed", "code": code}
+            return {"retryable": True, "reason": "rate_limited", "code": code}
+
+        if status_code in (401, 403):
+            return {"retryable": False, "reason": "forbidden", "code": None}
+        if status_code == 400:
+            return {"retryable": False, "reason": "bad_request", "code": (parsed or {}).get("error", {}).get("code")}
+        if status_code >= 500:
+            return {"retryable": True, "reason": "server_error", "code": (parsed or {}).get("error", {}).get("code")}
+        if status_code >= 400:
+            return {"retryable": False, "reason": "client_error", "code": None}
+        return {"retryable": True, "reason": "unknown", "code": None}
+
+    @staticmethod
+    def _smart_retry_delay(attempt: int, reason: str) -> float:
+        """Differentiated retry delay based on error type (mirrors glm-proxy)."""
+        if reason == "rate_limited":
+            delays = [1, 2, 4, 8, 16, 30, 60, 120]
+        elif reason == "server_error":
+            delays = [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0]
+        else:
+            delays = [0, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
+        return delays[min(attempt - 1, len(delays) - 1)]
 
     def _format_preliminary_text(self, preliminary_factors: dict[str, Any]) -> str:
         """
@@ -642,53 +754,114 @@ class SignalLLMClient:
             self._model = prev_model
             self._protocol = prev_protocol
 
+    # Max in-provider retries for transient errors (503/429) before falling back
+    _IN_PROVIDER_RETRIES = 3
+
     def _call_with_fallback(
         self,
         prompt: str,
         max_tokens_override: int | None = None,
         json_mode: bool = True,
     ) -> str:
-        """Try each provider in fallback_order. Skip dead providers.
+        """Try each provider with smart retry, then fall back to next.
 
-        - Transient errors (503/429/timeout) → log warning and try next.
-        - Permanent errors (400/401/ValidationError) → re-raise immediately.
-        - All providers exhausted → raise the last error.
-        - Providers missing from the pool (failed construction) → skipped.
+        Mirrors glm-proxy logic:
+        - 503: same-provider retry with escalating cooldown (0.3s→1.5s)
+        - 429 rate-limited: longer backoff (1s→120s)
+        - 429 auth failure: not retryable, raise immediately
+        - Refusal detection: Chinese safety refusal → retry same provider
+        - After in-provider retries exhausted → fall back to next provider
+        - Permanent errors (400/401/403) → raise immediately
         """
         last_error: Exception | None = None
         for provider_name in self._config.fallback_order:
             client = self._clients.get(provider_name)
             if client is None:
-                # Dead provider (construction failed at __init__) — skip.
                 continue
-            try:
-                return self._call_llm_with_provider(
-                    provider_name,
-                    client,
-                    prompt,
-                    max_tokens_override=max_tokens_override,
-                    json_mode=json_mode,
-                )
-            except Exception as e:
-                last_error = e
-                if self._is_transient_error(e):
-                    logger.warning(
-                        "Provider %s transient error, falling back: %s",
-                        provider_name, str(e)[:200],
+
+            # Get model name for this provider (for backoff key)
+            model = self._provider_models.get(provider_name, "unknown")
+
+            for attempt in range(1, self._IN_PROVIDER_RETRIES + 1):
+                # Wait if this model is in cooldown
+                if attempt > 1:
+                    self._wait_if_busy(provider_name, model)
+
+                try:
+                    result = self._call_llm_with_provider(
+                        provider_name,
+                        client,
+                        prompt,
+                        max_tokens_override=max_tokens_override,
+                        json_mode=json_mode,
                     )
-                    # Brief pause before next provider — gives the upstream
-                    # proxy a moment to recover. Without this, immediate
-                    # fallback hits the same overloaded backend 3x in a row.
-                    time.sleep(self._fallback_delay_seconds)
-                    continue
-                # Permanent error — don't try other providers.
-                raise
+
+                    # Check for refusal (Chinese safety rejection)
+                    if _is_refusal(result):
+                        logger.warning(
+                            "Provider %s refusal detected (attempt %d), retrying: %.60s",
+                            provider_name, attempt, result,
+                        )
+                        if attempt < self._IN_PROVIDER_RETRIES:
+                            time.sleep(0.5 * attempt)
+                            continue
+                        # Exhausted retries for refusal — fall through to next provider
+                        break
+
+                    # Success — reset backoff
+                    self._mark_ok(provider_name, model)
+                    return result
+
+                except Exception as e:
+                    last_error = e
+                    status = getattr(e, "status_code", None)
+
+                    # 503 → mark busy, retry same provider
+                    if status == 503:
+                        self._mark_busy(provider_name, model)
+                        if attempt < self._IN_PROVIDER_RETRIES:
+                            delay = self._smart_retry_delay(attempt, "server_error")
+                            logger.warning(
+                                "Provider %s 503 (attempt %d), retry in %.1fs",
+                                provider_name, attempt, delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                        logger.warning("Provider %s 503 exhausted %d retries, falling back", provider_name, attempt)
+                        break
+
+                    # 429 → check if auth failure vs rate limit
+                    if status == 429:
+                        err_body = str(e)
+                        err_info = self._parse_upstream_error(429, err_body)
+                        if not err_info["retryable"]:
+                            raise  # Auth failure — permanent
+                        self._mark_rate_limited(provider_name, model)
+                        if attempt < self._IN_PROVIDER_RETRIES:
+                            delay = self._smart_retry_delay(attempt, "rate_limited")
+                            logger.warning(
+                                "Provider %s 429 rate-limited (attempt %d), retry in %.1fs",
+                                provider_name, attempt, delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                        break
+
+                    # Other transient → try next provider
+                    if self._is_transient_error(e):
+                        logger.warning(
+                            "Provider %s transient error, falling back: %s",
+                            provider_name, str(e)[:200],
+                        )
+                        time.sleep(self._fallback_delay_seconds)
+                        break
+
+                    # Permanent error → don't try other providers
+                    raise
+
         if last_error is not None:
             raise last_error
-        # No providers in pool at all (should be caught by __init__).
-        raise RuntimeError(
-            "No LLM providers available — client pool is empty."
-        )
+        raise RuntimeError("No LLM providers available — client pool is empty.")
 
     def _call_openai(self, prompt: str, max_tokens_override: int | None = None,
                      json_mode: bool = True) -> str:
