@@ -57,6 +57,7 @@ class AppState:
         self.signal_service: SignalService | None = None
         self.signal_engine: SignalEngine | None = None
         self.webhook_dispatcher = None
+        self.bot_pusher = None
         self.source_quality_tracker = None
 
     # ── _load_or_create_auth_token (api.py:99) ──────────────────────────
@@ -123,6 +124,10 @@ class AppState:
         # downstream-facing output works even if LLM api_key is missing.
         from tgwatcher.webhook import WebhookDispatcher
         self.webhook_dispatcher = WebhookDispatcher(config)
+
+        # Bot pusher — Telegram Bot API push for new signals.
+        from tgwatcher.bot_push import BotPusher
+        self.bot_pusher = BotPusher(config.get("signal", {}))
 
         # Auto-catchup on startup
         catchup_cfg = config.get("catchup", {})
@@ -235,6 +240,7 @@ class AppState:
         self.signal_engine = SignalEngine(
             self.storage, keyword_filter, llm_client, signal_cfg,
             webhook_dispatcher=self.webhook_dispatcher,
+            bot_pusher=self.bot_pusher,
             deduper=deduper,
         )
 

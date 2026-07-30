@@ -26,6 +26,7 @@ class SignalEngine:
     def __init__(self, storage: Storage, keyword_filter: KeywordFilter,
                  llm: SignalLLMClient, config: dict,
                  webhook_dispatcher=None,
+                 bot_pusher=None,
                  deduper=None):
         self._storage = storage
         self._filter = keyword_filter
@@ -37,6 +38,8 @@ class SignalEngine:
         self._factor_version = config.get("factor_version", 2)
         # Webhook dispatcher (optional). None = no webhook dispatch.
         self._webhook = webhook_dispatcher
+        # Bot pusher (optional). None = no Telegram Bot push.
+        self._bot_pusher = bot_pusher
         # Signal deduper (optional). None = no dedup, all is_signal=True
         # signals are pushed downstream. When set, filters new_signal SSE +
         # webhook dispatch for same-key signals within window_seconds.
@@ -433,6 +436,14 @@ class SignalEngine:
                             logger.warning(
                                 "Webhook dispatch failed for msg %d: %s",
                                 msg["message_id"], wh_err,
+                            )
+                    if self._bot_pusher and self._bot_pusher.enabled:
+                        try:
+                            self._bot_pusher.dispatch(payload)
+                        except Exception as bp_err:
+                            logger.warning(
+                                "Bot push failed for msg %d: %s",
+                                msg["message_id"], bp_err,
                             )
 
             return factor
