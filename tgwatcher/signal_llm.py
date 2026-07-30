@@ -143,6 +143,11 @@ class LLMRefineError(Exception):
     pass
 
 
+class LLMTruncatedError(LLMRefineError):
+    """Raised when LLM output was cut off by max_tokens (finish_reason=length)."""
+    pass
+
+
 @dataclass
 class LLMConfig:
     """Configuration for LLM client.
@@ -733,7 +738,12 @@ class SignalLLMClient:
                 "LLM call completed: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
             )
-        return response.choices[0].message.content.strip()
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise LLMTruncatedError(
+                f"Output truncated (finish_reason=length, max_tokens={max_tokens})"
+            )
+        return choice.message.content.strip()
 
     def _call_anthropic(self, prompt: str, max_tokens_override: int | None = None,
                         json_mode: bool = True) -> str:
@@ -777,6 +787,10 @@ class SignalLLMClient:
         # for text response, content[0].text holds the output.
         if not response.content:
             raise LLMRefineError("Anthropic returned empty content")
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise LLMTruncatedError(
+                f"Output truncated (stop_reason=max_tokens, max_tokens={max_tokens})"
+            )
         raw = response.content[0].text.strip()
         usage = getattr(response, "usage", None)
         if usage:
@@ -828,6 +842,9 @@ class SignalLLMClient:
 
             except json.JSONDecodeError as e:
                 logger.warning("LLM JSON parse error (attempt %d): %s", attempt + 1, e)
+            except LLMTruncatedError as e:
+                logger.warning("LLM output truncated (attempt %d): %s — skipping retries", attempt + 1, e)
+                raise
             except LLMRefineError as e:
                 logger.warning("LLM validation error (attempt %d): %s", attempt + 1, e)
             except Exception as e:
@@ -931,6 +948,9 @@ class SignalLLMClient:
 
             except json.JSONDecodeError as e:
                 logger.warning("LLM batch JSON parse error (attempt %d): %s", attempt + 1, e)
+            except LLMTruncatedError as e:
+                logger.warning("LLM batch truncated (attempt %d): %s — skipping retries, degrading to individual calls", attempt + 1, e)
+                break
             except LLMRefineError as e:
                 logger.warning("LLM batch validation error (attempt %d): %s", attempt + 1, e)
             except Exception as e:
