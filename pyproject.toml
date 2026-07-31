@@ -29,3 +29,10 @@ include = ["tgwatcher*"]
 
 [tool.setuptools.package-data]
 tgwatcher = ["web/static/*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: unit tests (fast, isolated)",
+    "integration: integration tests (DB, network)",
+    "e2e: end-to-end tests",
+]

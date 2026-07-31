@@ -151,7 +151,7 @@ class BotPusher:
         if not sub.plan_id:
             return True  # No plan = legacy, no quota
         from tgwatcher.models import SubscriptionPlan
-        plan = sess.query(SubscriptionPlan).get(sub.plan_id)
+        plan = sess.get(SubscriptionPlan, sub.plan_id)
         if not plan or plan.max_signals_per_day == 0:
             return True  # Unlimited quota
         today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
